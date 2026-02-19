@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+dist/
+build/
+wheels/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS generated
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Isaac Sim / NVIDIA
+_isaac_sim/
+*.lock
+
+# Logs & outputs
+*.log
+logs/
+
+# Data & checkpoints (uncomment if needed)
+# data/
+# checkpoints/
+# *.pth
+# *.ckpt
+# *.pt
+
+# Temporary files
+*.tmp
+*.bak
+
+assets/
