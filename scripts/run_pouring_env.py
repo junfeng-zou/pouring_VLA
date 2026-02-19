@@ -67,11 +67,11 @@ def main():
             if 0 < args.max_steps <= step:
                 break
 
-            # Generate sinusoidal actions for demo
+            # Generate actions: arm stays still, gripper goes from open → closed
             actions = torch.zeros(env.num_envs, cfg.action_space, device=env.device)
-            # for j in range(cfg.action_space):
-            #     phase = j * (2.0 * math.pi / cfg.action_space)
-            #     actions[:, j] = 0.5 * math.sin(0.4 * math.pi * t + phase)
+            # Gripper: +1 = open, -1 = closed.  Linearly close over 10 seconds.
+            gripper_val = 1.0 - 2.0 * min(t / 10.0, 1.0)  # +1 → -1
+            actions[:, 6] = gripper_val
 
             # Step
             obs, reward, terminated, truncated, info = env.step(actions)
@@ -79,13 +79,13 @@ def main():
 
             # Print status periodically
             if step % 100 == 0:
-                jpos = obs["policy"][0, :6]
-                ee_pos = obs["policy"][0, 12:15]
+                ee_pos = obs["policy"][0, 14:17]
+                grip_pos = obs["policy"][0, 12:14]  # finger positions
                 water = info.get("log", {}).get("water_in_cup", 0.0)
                 print(
                     f"  [step={step:5d}, t={t:6.2f}s]"
-                    f"  reward={reward[0].item():+.4f}"
-                    f"  water_in_cup={water:.1f}"
+                    f"  gripper_cmd={gripper_val:+.2f}"
+                    f"  finger_pos=[{grip_pos[0]:.4f}, {grip_pos[1]:.4f}]"
                     f"  ee_pos=[{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]"
                 )
 

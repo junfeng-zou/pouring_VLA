@@ -54,6 +54,7 @@ _USD_PATH = os.path.join(
 NUM_WATER_SPHERES = 50
 WATER_SPHERE_RADIUS = 0.008  # 8 mm
 WALL_THICKNESS = 0.004       # container wall thickness
+GRIPPER_MAX_OPEN = 0.055     # max finger travel (must match URDF upper limit)
 
 # -- Geometry ---------------------------------------------------------------
 TABLE_SIZE = (1.2, 0.8, 0.75)  # length, width, height
@@ -75,8 +76,8 @@ class PouringEnvCfg(DirectRLEnvCfg):
     # -- env --
     episode_length_s = 10.0
     decimation = 2
-    action_space = 6       # 6 joint position deltas
-    observation_space = 18  # 6 jpos + 6 jvel + 3 bottle_tip + 3 cup_pos
+    action_space = 7       # 6 arm joint deltas + 1 gripper (open/close)
+    observation_space = 20  # 6 jpos + 6 jvel + 2 gripper_pos + 3 ee_pos + 3 cup_pos
     state_space = 0
 
     # -- simulation --
@@ -125,6 +126,8 @@ class PouringEnvCfg(DirectRLEnvCfg):
                 "joint_4": 0.0,
                 "joint_5": -1.5708,  # wrist down
                 "joint_6": 0.0,
+                "finger_left_joint": GRIPPER_MAX_OPEN,   # open
+                "finger_right_joint": GRIPPER_MAX_OPEN,  # open
             },
         ),
         actuators={
@@ -139,6 +142,13 @@ class PouringEnvCfg(DirectRLEnvCfg):
                 joint_names_expr=["joint_[4-6]"],
                 effort_limit=28.0,
                 velocity_limit=1.7453,
+                stiffness=200.0,
+                damping=20.0,
+            ),
+            "gripper": ImplicitActuatorCfg(
+                joint_names_expr=["finger_.*_joint"],
+                effort_limit=20.0,
+                velocity_limit=0.2,
                 stiffness=200.0,
                 damping=20.0,
             ),
@@ -354,11 +364,23 @@ class PouringEnv(DirectRLEnv):
     # ----- Pre-physics -------------------------------------------------------
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        """Convert actions to joint position targets."""
+        """Convert actions to joint position targets.
+
+        Actions: 7-dim = [6 arm joint deltas, 1 gripper (mapped to 2 finger joints)].
+        """
         self.actions = actions.clone().clamp(-1.0, 1.0)
-        # Actions are scaled deltas added to current targets
-        delta = self.actions * self.cfg.action_scale
-        self.robot_dof_targets += delta
+
+        # Arm joints (indices 0-5): scaled deltas
+        arm_delta = self.actions[:, :6] * self.cfg.action_scale
+        self.robot_dof_targets[:, :6] += arm_delta
+
+        # Gripper (index 6): single action controls both fingers
+        # Map action [-1, 1] to [0, 0.04] (closed to open)
+        gripper_cmd = (self.actions[:, 6:7] + 1.0) / 2.0 * GRIPPER_MAX_OPEN  # [0, GRIPPER_MAX_OPEN]
+        self.robot_dof_targets[:, 6] = gripper_cmd[:, 0]   # finger_left
+        self.robot_dof_targets[:, 7] = gripper_cmd[:, 0]   # finger_right (mirrored in URDF)
+
+        # Clamp all to joint limits
         self.robot_dof_targets[:] = torch.clamp(
             self.robot_dof_targets,
             self.robot_dof_lower_limits,
@@ -372,7 +394,7 @@ class PouringEnv(DirectRLEnv):
     # ----- Post-physics ------------------------------------------------------
 
     def _get_observations(self) -> dict:
-        """Observation: joint pos (6) + joint vel (6) + EE pos (3) + cup pos (3) = 18."""
+        """Observation: arm_jpos(6) + arm_jvel(6) + gripper_pos(2) + EE_pos(3) + cup_pos(3) = 20."""
         joint_pos = self._robot.data.joint_pos
         joint_vel = self._robot.data.joint_vel
 
@@ -385,10 +407,11 @@ class PouringEnv(DirectRLEnv):
         )
 
         obs = torch.cat([
-            joint_pos,                          # (N, 6)
-            joint_vel * 0.1,                    # (N, 6), scaled
-            ee_pos_w - self.scene.env_origins,  # (N, 3), local EE pos
-            cup_pos_local,                      # (N, 3), local cup pos
+            joint_pos[:, :6],                   # (N, 6), arm joint positions
+            joint_vel[:, :6] * 0.1,             # (N, 6), arm joint velocities, scaled
+            joint_pos[:, 6:8],                  # (N, 2), gripper finger positions
+            ee_pos_w - self.scene.env_origins,   # (N, 3), local EE pos
+            cup_pos_local,                       # (N, 3), local cup pos
         ], dim=-1)
 
         return {"policy": torch.clamp(obs, -5.0, 5.0)}
