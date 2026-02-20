@@ -28,6 +28,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import CameraCfg
 from isaaclab.sim import SimulationCfg
 
 from isaaclab.utils import configclass
@@ -68,7 +69,6 @@ BOTTLE_RADIUS = 0.035
 BOTTLE_HEIGHT = 0.20
 BOTTLE_POS = (0.7, 0.3, TABLE_SIZE[2] + BOTTLE_HEIGHT / 2.0)  # on the table, offset from cup in Y
 
-
 @configclass
 class PouringEnvCfg(DirectRLEnvCfg):
     """Configuration for the DOBOT Nova 5 pouring environment."""
@@ -100,7 +100,25 @@ class PouringEnvCfg(DirectRLEnvCfg):
         replicate_physics=True,
     )
 
-
+    # -- third-person camera (Orbbec Femto Bolt RGB mode) --
+    # Femto Bolt RGB: 1920x1080, HFOV ≈ 80°
+    camera = CameraCfg(
+        prim_path="/World/envs/env_.*/Camera",
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=12.49,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 10.0),
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.56, 0.01, 1.67),
+            rot=(-0.5000, -0.5000, -0.5000, 0.5000),  # (w, x, y, z)
+            convention="world",
+        ),
+        width=1920,
+        height=1080,
+        data_types=["rgb", "distance_to_image_plane"],
+        update_period=0.1,
+    )
 
     # -- robot --
     robot = ArticulationCfg(
@@ -255,6 +273,11 @@ class PouringEnv(DirectRLEnv):
         # -- Table --
         self._table = RigidObject(self.cfg.table)
         self.scene.rigid_objects["table"] = self._table
+
+        # -- Camera (third-person, Femto Bolt) --
+        from isaaclab.sensors import Camera
+        self._camera = Camera(self.cfg.camera)
+        self.scene.sensors["camera"] = self._camera
 
         # -- Cup and Bottle (hollow containers via USD API) --
         import omni.usd

@@ -34,7 +34,11 @@ def main():
     args = parser.parse_args()
 
     # Launch Sim
-    sim_app = SimulationApp({"headless": args.headless, "width": 1280, "height": 720})
+    sim_app = SimulationApp({"headless": args.headless, "width": 1280, "height": 720, "enable_cameras": True})
+
+    # Enable camera rendering for Isaac Lab sensors
+    import carb
+    carb.settings.get_settings().set_bool("/isaaclab/cameras_enabled", True)
 
     # Now we can import Isaac Lab modules
     from envs.pouring_env import PouringEnv, PouringEnvCfg
@@ -60,6 +64,9 @@ def main():
     print(f"[Reset] Obs shape: {obs['policy'].shape}")
 
     # ------ Run loop ------
+    import cv2
+    import numpy as np
+
     step = 0
     t = 0.0
     try:
@@ -89,12 +96,49 @@ def main():
                     f"  ee_pos=[{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]"
                 )
 
+            # --- Camera visualization (every 6 steps ≈ 10 Hz) ---
+            if step % 6 == 0:
+                cam_data = env._camera.data
+                if "rgb" in cam_data.output and "distance_to_image_plane" in cam_data.output:
+                    # RGB: (N, H, W, 3) uint8 on GPU → numpy
+                    rgb = cam_data.output["rgb"][0].cpu().numpy()        # (H, W, 3)
+                    rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+                    # Depth: (N, H, W, 1) float32 on GPU → numpy
+                    depth = cam_data.output["distance_to_image_plane"][0].cpu().numpy()  # (H, W, 1)
+                    depth = depth.squeeze(-1)  # (H, W)
+
+                    # Normalize depth to 0-255 for visualization
+                    valid = np.isfinite(depth)
+                    if valid.any():
+                        d_min, d_max = depth[valid].min(), depth[valid].max()
+                        depth_norm = np.zeros_like(depth, dtype=np.uint8)
+                        if d_max > d_min:
+                            depth_norm[valid] = ((depth[valid] - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+                    else:
+                        depth_norm = np.zeros_like(depth, dtype=np.uint8)
+
+                    # Apply colormap
+                    depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_TURBO)
+
+                    # Resize both to 1/4 (480x270)
+                    h, w = rgb_bgr.shape[:2]
+                    small_size = (w // 4, h // 4)
+                    rgb_small = cv2.resize(rgb_bgr, small_size)
+                    depth_small = cv2.resize(depth_color, small_size)
+
+                    # Concatenate side by side
+                    combined = np.hstack([rgb_small, depth_small])
+                    cv2.imshow("Camera: RGB | Depth", combined)
+                    cv2.waitKey(1)
+
             step += 1
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user.")
 
     # ------ Cleanup ------
+    cv2.destroyAllWindows()
     env.close()
     sim_app.close()
     print("[INFO] Done.")
