@@ -42,8 +42,8 @@ _isaac_sim/
 *.log
 logs/
 
-# Data & checkpoints (uncomment if needed)
-# data/
+# Data & checkpoints
+data/vla_dataset/*.hdf5
 # checkpoints/
 # *.pth
 # *.ckpt

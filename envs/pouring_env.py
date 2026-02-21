@@ -26,13 +26,15 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import CameraCfg
 from isaaclab.sim import SimulationCfg
 
 from isaaclab.utils import configclass
-from isaaclab.utils.math import sample_uniform
+from isaaclab.utils.math import sample_uniform, subtract_frame_transforms
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -63,20 +65,20 @@ TABLE_POS = (0.3, 0.0, TABLE_SIZE[2] / 2.0)  # robot at x=0, table extends from 
 
 CUP_RADIUS = 0.04
 CUP_HEIGHT = 0.10
-CUP_POS = (0.7, 0.0, TABLE_SIZE[2] + CUP_HEIGHT / 2.0)
+CUP_POS = (0.5, 0.0, TABLE_SIZE[2] + CUP_HEIGHT / 2.0)
 
 BOTTLE_RADIUS = 0.035
 BOTTLE_HEIGHT = 0.20
-BOTTLE_POS = (0.7, 0.3, TABLE_SIZE[2] + BOTTLE_HEIGHT / 2.0)  # on the table, offset from cup in Y
+BOTTLE_POS = (0.5, 0.3, TABLE_SIZE[2] + BOTTLE_HEIGHT / 2.0)  # on the table, offset from cup in Y
 
 @configclass
 class PouringEnvCfg(DirectRLEnvCfg):
     """Configuration for the DOBOT Nova 5 pouring environment."""
 
     # -- env --
-    episode_length_s = 10.0
+    episode_length_s = 120.0
     decimation = 2
-    action_space = 7       # 6 arm joint deltas + 1 gripper (open/close)
+    action_space = 7       # 3 EE position deltas + 3 EE orientation deltas + 1 gripper
     observation_space = 20  # 6 jpos + 6 jvel + 2 gripper_pos + 3 ee_pos + 3 cup_pos
     state_space = 0
 
@@ -140,7 +142,7 @@ class PouringEnvCfg(DirectRLEnvCfg):
             joint_pos={
                 "joint_1": 0.0,
                 "joint_2": 0.0,
-                "joint_3": 1.5708,   # elbow up
+                "joint_3": -1.5708,   # elbow up
                 "joint_4": 0.0,
                 "joint_5": -1.5708,  # wrist down
                 "joint_6": 0.0,
@@ -220,7 +222,8 @@ class PouringEnvCfg(DirectRLEnvCfg):
     bottle_orientation_reward_scale = 1.0
 
     # -- action scale --
-    action_scale = 0.05  # radians per step
+    pos_action_scale = 0.01    # meters per step (for EE position)
+    rot_action_scale = 0.02    # radians per step (for EE orientation)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +256,30 @@ class PouringEnv(DirectRLEnv):
         # End-effector link index
         self.ee_link_idx = self._robot.find_bodies("link_6")[0][0]
 
+        # -- Differential IK Controller --
+        self._ik_cfg = DifferentialIKControllerCfg(
+            command_type="pose",
+            use_relative_mode=True,
+            ik_method="dls",
+            ik_params={"lambda_val": 0.05},
+        )
+        self._ik_controller = DifferentialIKController(
+            self._ik_cfg, num_envs=cfg.scene.num_envs, device=self.device
+        )
+
+        # Resolve robot entity for IK (arm joints only, 6-DoF)
+        self._robot_entity_cfg = SceneEntityCfg(
+            "robot",
+            joint_names=["joint_[1-6]"],
+            body_names=["link_6"],
+        )
+        self._robot_entity_cfg.resolve(self.scene)
+        # Jacobian frame index: for fixed-base, body_id - 1
+        if self._robot.is_fixed_base:
+            self._ee_jacobi_idx = self._robot_entity_cfg.body_ids[0] - 1
+        else:
+            self._ee_jacobi_idx = self._robot_entity_cfg.body_ids[0]
+
         # Cup position (fixed, per env)
         self.cup_pos = torch.tensor(
             [CUP_POS] * self.num_envs, device=self.device, dtype=torch.float32
@@ -263,6 +290,9 @@ class PouringEnv(DirectRLEnv):
         # Water tracking
         self.num_water = NUM_WATER_SPHERES
         self.water_in_cup_count = torch.zeros(self.num_envs, device=self.device)
+
+        # PhysX view for bottle — created lazily on first reset
+        self._bottle_physx_view = None
 
     def _setup_scene(self):
         """Create the full scene: robot, table, cup, bottle, water, lights."""
@@ -297,7 +327,10 @@ class PouringEnv(DirectRLEnv):
             thickness=WALL_THICKNESS,
             color=(0.1, 0.3, 0.8),
             position=BOTTLE_POS,
+            kinematic=False,  # dynamic — can be grasped and moved
+            mass=0.3,         # 300g bottle
         )
+        self._bottle_prim_path = "/World/envs/env_0/Bottle"
 
         # -- Water spheres --
         # We spawn them individually with unique prim paths
@@ -335,12 +368,17 @@ class PouringEnv(DirectRLEnv):
 
     @staticmethod
     def _create_hollow_container(
-        stage, prim_path, radius, height, thickness, color, position, num_segments=24
+        stage, prim_path, radius, height, thickness, color, position,
+        num_segments=24, kinematic=True, mass=None,
     ):
         """Create a hollow open-top cylinder from compound collision shapes.
 
         Structure: 1 bottom disk + N thin wall segments arranged in a ring.
-        The container is kinematic (fixed in space).
+
+        Args:
+            kinematic: If True, container is fixed in space.
+                       If False, container is a dynamic rigid body (can be moved/grasped).
+            mass: Mass in kg (only used when kinematic=False).
         """
         from pxr import UsdGeom, UsdPhysics, Gf
 
@@ -348,9 +386,28 @@ class PouringEnv(DirectRLEnv):
         xform = UsdGeom.Xform.Define(stage, prim_path)
         xform.AddTranslateOp().Set(Gf.Vec3d(*position))
 
-        # Mark as kinematic rigid body
+        # Rigid body
         rb = UsdPhysics.RigidBodyAPI.Apply(xform.GetPrim())
-        rb.CreateKinematicEnabledAttr(True)
+        rb.CreateKinematicEnabledAttr(kinematic)
+
+        # Mass (for dynamic bodies)
+        if not kinematic and mass is not None:
+            mass_api = UsdPhysics.MassAPI.Apply(xform.GetPrim())
+            mass_api.CreateMassAttr(mass)
+
+        # --- Friction material for collision surfaces ---
+        mat_path = f"{prim_path}/friction_material"
+        UsdShade = __import__("pxr", fromlist=["UsdShade"]).UsdShade
+        mat = UsdShade.Material.Define(stage, mat_path)
+        phys_mat = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
+        phys_mat.CreateStaticFrictionAttr(1.0)
+        phys_mat.CreateDynamicFrictionAttr(1.0)
+        phys_mat.CreateRestitutionAttr(0.0)
+
+        def _apply_friction(prim):
+            """Bind friction material to a collision prim."""
+            binding = UsdShade.MaterialBindingAPI.Apply(prim)
+            binding.Bind(mat, UsdShade.Tokens.weakerThanDescendants, "physics")
 
         # --- Bottom plate (thin cylinder) ---
         bottom = UsdGeom.Cylinder.Define(stage, f"{prim_path}/bottom")
@@ -359,6 +416,7 @@ class PouringEnv(DirectRLEnv):
         bottom.CreateAxisAttr("Z")
         bottom.CreateDisplayColorAttr([Gf.Vec3f(*color)])
         UsdPhysics.CollisionAPI.Apply(bottom.GetPrim())
+        _apply_friction(bottom.GetPrim())
         UsdGeom.Xformable(bottom.GetPrim()).AddTranslateOp().Set(
             Gf.Vec3d(0, 0, -height / 2.0 + thickness / 2.0)
         )
@@ -377,6 +435,7 @@ class PouringEnv(DirectRLEnv):
             seg.CreateSizeAttr(1.0)  # unit cube, scaled below
             seg.CreateDisplayColorAttr([Gf.Vec3f(*color)])
             UsdPhysics.CollisionAPI.Apply(seg.GetPrim())
+            _apply_friction(seg.GetPrim())
 
             sx = UsdGeom.Xformable(seg.GetPrim())
             sx.AddTranslateOp().Set(Gf.Vec3d(cx, cy, 0))
@@ -387,21 +446,60 @@ class PouringEnv(DirectRLEnv):
     # ----- Pre-physics -------------------------------------------------------
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        """Convert actions to joint position targets.
+        """Convert Cartesian EE actions to joint position targets via differential IK.
 
-        Actions: 7-dim = [6 arm joint deltas, 1 gripper (mapped to 2 finger joints)].
+        Actions: 7-dim = [dx, dy, dz, droll, dpitch, dyaw, gripper].
+        - [0:3] — EE position delta in root frame (meters)
+        - [3:6] — EE orientation delta as axis-angle in root frame (radians)
+        - [6]   — gripper command: +1 = open, -1 = closed
         """
         self.actions = actions.clone().clamp(-1.0, 1.0)
 
-        # Arm joints (indices 0-5): scaled deltas
-        arm_delta = self.actions[:, :6] * self.cfg.action_scale
-        self.robot_dof_targets[:, :6] += arm_delta
+        # Scale Cartesian deltas
+        cart_delta = torch.zeros(self.num_envs, 6, device=self.device)
+        cart_delta[:, 0:3] = self.actions[:, 0:3] * self.cfg.pos_action_scale
+        cart_delta[:, 3:6] = self.actions[:, 3:6] * self.cfg.rot_action_scale
+
+        # Only update arm targets when there is actual Cartesian input.
+        # Otherwise keep previous targets so PD controller holds position against gravity.
+        has_input = cart_delta.abs().sum(dim=1) > 1e-8  # (num_envs,)
+
+        if has_input.any():
+            # Get current EE pose in root frame
+            ee_pose_w = self._robot.data.body_pose_w[:, self._robot_entity_cfg.body_ids[0]]
+            root_pose_w = self._robot.data.root_pose_w
+            ee_pos_b, ee_quat_b = subtract_frame_transforms(
+                root_pose_w[:, 0:3], root_pose_w[:, 3:7],
+                ee_pose_w[:, 0:3], ee_pose_w[:, 3:7],
+            )
+
+            # Set IK command (relative delta)
+            self._ik_controller.set_command(cart_delta, ee_pos=ee_pos_b, ee_quat=ee_quat_b)
+
+            # Get Jacobian and current arm joint positions
+            jacobian = self._robot.root_physx_view.get_jacobians()[
+                :, self._ee_jacobi_idx, :, self._robot_entity_cfg.joint_ids
+            ]
+            arm_joint_pos = self._robot.data.joint_pos[:, self._robot_entity_cfg.joint_ids]
+
+            # Compute IK: returns actual_pos + delta
+            arm_joint_targets = self._ik_controller.compute(
+                ee_pos_b, ee_quat_b, jacobian, arm_joint_pos
+            )
+
+            # Extract pure delta and apply to PREVIOUS TARGETS (not actual pos).
+            # This prevents "accepting" gravity drift on each input step.
+            joint_ids = self._robot_entity_cfg.joint_ids
+            ik_delta = arm_joint_targets - arm_joint_pos  # pure IK delta
+            for i in range(self.num_envs):
+                if has_input[i]:
+                    self.robot_dof_targets[i, joint_ids] += ik_delta[i]
 
         # Gripper (index 6): single action controls both fingers
-        # Map action [-1, 1] to [0, 0.04] (closed to open)
-        gripper_cmd = (self.actions[:, 6:7] + 1.0) / 2.0 * GRIPPER_MAX_OPEN  # [0, GRIPPER_MAX_OPEN]
+        # Map action [-1, 1] to [0, GRIPPER_MAX_OPEN] (closed to open)
+        gripper_cmd = (self.actions[:, 6:7] + 1.0) / 2.0 * GRIPPER_MAX_OPEN
         self.robot_dof_targets[:, 6] = gripper_cmd[:, 0]   # finger_left
-        self.robot_dof_targets[:, 7] = gripper_cmd[:, 0]   # finger_right (mirrored in URDF)
+        self.robot_dof_targets[:, 7] = gripper_cmd[:, 0]   # finger_right
 
         # Clamp all to joint limits
         self.robot_dof_targets[:] = torch.clamp(
@@ -500,7 +598,8 @@ class PouringEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.robot_dof_targets[env_ids] = joint_pos
 
-        # Bottle is kinematic (fixed position), no reset needed
+        # Reset bottle — TODO: implement proper dynamic body reset
+        # (Bottle position is not reset currently; press Y early before it falls over)
 
         # Reset water spheres — arrange inside the bottle
         bottle_x, bottle_y, bottle_z = BOTTLE_POS
