@@ -89,8 +89,8 @@ class PouringEnvCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=0.8,
-            dynamic_friction=0.6,
+            static_friction=1.0,
+            dynamic_friction=0.8,
             restitution=0.1,
         ),
     )
@@ -112,13 +112,38 @@ class PouringEnvCfg(DirectRLEnvCfg):
             clipping_range=(0.1, 10.0),
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.56, 0.01, 1.67),
-            rot=(-0.5000, -0.5000, -0.5000, 0.5000),  # (w, x, y, z)
+            # pos=(0.56, 0.01, 1.67),
+            pos=(0.81, 0.15, 0.96),             # in front of workspace
+            rot=(0.0000, 0.0000, 0.0000, 1.0000),   # 90° around Y → look along -X
+            # rot=(0, 0, 0.34645, 0.93807),  # (w, x, y, z)
             convention="world",
         ),
-        width=1920,
-        height=1080,
+        width=640,
+        height=360,
         data_types=["rgb", "distance_to_image_plane"],
+        update_period=0.1,
+    )
+
+    # cam_top removed for performance
+
+    # Side-view camera: from the front, looking back at workspace
+    # 90° rotation around Y: camera -Z → world -X (looking toward table)
+    cam_side = CameraCfg(
+        prim_path="/World/envs/env_.*/CamSide",
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=8.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 10.0),
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.56, 0.636, 1.54),
+            rot=(-0.6423, -0.2958, -0.2958, 0.6423),  # (w, x, y, z)
+            # rot=(0.5, 0.5, 0.5, 0.5),   # 90° around Y → look along -X
+            convention="world",
+        ),
+        width=640,
+        height=480,
+        data_types=["rgb"],
         update_period=0.1,
     )
 
@@ -167,10 +192,10 @@ class PouringEnvCfg(DirectRLEnvCfg):
             ),
             "gripper": ImplicitActuatorCfg(
                 joint_names_expr=["finger_.*_joint"],
-                effort_limit=20.0,
+                effort_limit=60.0,
                 velocity_limit=0.2,
-                stiffness=200.0,
-                damping=20.0,
+                stiffness=800.0,
+                damping=40.0,
             ),
         },
     )
@@ -222,8 +247,8 @@ class PouringEnvCfg(DirectRLEnvCfg):
     bottle_orientation_reward_scale = 1.0
 
     # -- action scale --
-    pos_action_scale = 0.01    # meters per step (for EE position)
-    rot_action_scale = 0.02    # radians per step (for EE orientation)
+    pos_action_scale = 0.005   # meters per step (for EE position)
+    rot_action_scale = 0.01    # radians per step (for EE orientation)
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +334,11 @@ class PouringEnv(DirectRLEnv):
         self._camera = Camera(self.cfg.camera)
         self.scene.sensors["camera"] = self._camera
 
+        # -- Operator guidance cameras (side view only) --
+        from isaaclab.sensors import Camera
+        self._cam_side = Camera(self.cfg.cam_side)
+        self.scene.sensors["cam_side"] = self._cam_side
+
         # -- Cup and Bottle (hollow containers via USD API) --
         import omni.usd
         from pxr import UsdGeom, UsdPhysics, Gf
@@ -331,6 +361,19 @@ class PouringEnv(DirectRLEnv):
             mass=0.3,         # 300g bottle
         )
         self._bottle_prim_path = "/World/envs/env_0/Bottle"
+
+        # Wrap the bottle as an Isaac Lab RigidObject so we can use
+        # write_root_pose_to_sim() for proper physics-level reset.
+        # spawn=None because the prim already exists from _create_hollow_container.
+        bottle_cfg = RigidObjectCfg(
+            prim_path="/World/envs/env_.*/Bottle",
+            spawn=None,
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=BOTTLE_POS,
+            ),
+        )
+        self._bottle_obj = RigidObject(bottle_cfg)
+        self.scene.rigid_objects["bottle"] = self._bottle_obj
 
         # -- Water spheres --
         # We spawn them individually with unique prim paths
@@ -598,8 +641,19 @@ class PouringEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.robot_dof_targets[env_ids] = joint_pos
 
-        # Reset bottle — TODO: implement proper dynamic body reset
-        # (Bottle position is not reset currently; press Y early before it falls over)
+        # Reset bottle (dynamic rigid body) using RigidObject API
+        bottle_pos = torch.tensor(
+            [BOTTLE_POS], device=self.device, dtype=torch.float32
+        ).repeat(len(env_ids), 1)
+        bottle_pos += self.scene.env_origins[env_ids]
+        bottle_quat = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]], device=self.device
+        ).repeat(len(env_ids), 1)
+        bottle_vel = torch.zeros((len(env_ids), 6), device=self.device)
+        self._bottle_obj.write_root_pose_to_sim(
+            torch.cat([bottle_pos, bottle_quat], dim=-1), env_ids=env_ids
+        )
+        self._bottle_obj.write_root_velocity_to_sim(bottle_vel, env_ids=env_ids)
 
         # Reset water spheres — arrange inside the bottle
         bottle_x, bottle_y, bottle_z = BOTTLE_POS

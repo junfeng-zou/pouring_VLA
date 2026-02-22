@@ -221,6 +221,11 @@ def main():
 
     # ── OpenCV visualization ──
     import cv2
+    import numpy as np
+
+    TELEOP_WIN = "Teleop Cameras"
+    cv2.namedWindow(TELEOP_WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(TELEOP_WIN, 900, 300)
 
     # ── Reset ──
     obs, info = env.reset()
@@ -333,29 +338,61 @@ def main():
 
             # ---------- Visualization ----------
             if step % 6 == 0:
+                panel_h = 300  # fixed height for all panels
+                panels = []
+
+                # -- Main camera (data collection camera) --
                 cam_data = env._camera.data
-                if "rgb" in cam_data.output:
+                if "rgb" in cam_data.output and cam_data.output["rgb"].numel() > 0:
                     rgb_vis = cam_data.output["rgb"][0].cpu().numpy()
                     if rgb_vis.shape[-1] == 4:
                         rgb_vis = rgb_vis[:, :, :3]
-                    rgb_bgr = cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
+                    main_bgr = cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
+                    h, w = main_bgr.shape[:2]
+                    panel_w = int(w * panel_h / h)
+                    main_bgr = cv2.resize(main_bgr, (panel_w, panel_h))
+                else:
+                    main_bgr = np.zeros((panel_h, int(panel_h * 16 / 9), 3), dtype=np.uint8)
+                    cv2.putText(main_bgr, "Main: No Data", (10, panel_h // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)
+                panels.append(main_bgr)
 
-                    # Resize for display
-                    h, w = rgb_bgr.shape[:2]
-                    display = cv2.resize(rgb_bgr, (w // 4, h // 4))
+                # -- Auxiliary camera (side view) --
+                for cam_obj, label in [
+                    (env._cam_side, "Side View"),
+                ]:
+                    cam_d = cam_obj.data
+                    if "rgb" in cam_d.output and cam_d.output["rgb"].numel() > 0:
+                        aux_rgb = cam_d.output["rgb"][0].cpu().numpy()
+                        if aux_rgb.shape[-1] == 4:
+                            aux_rgb = aux_rgb[:, :, :3]
+                        aux_bgr = cv2.cvtColor(aux_rgb, cv2.COLOR_RGB2BGR)
+                        h, w = aux_bgr.shape[:2]
+                        panel_w = int(w * panel_h / h)
+                        aux_bgr = cv2.resize(aux_bgr, (panel_w, panel_h))
+                    else:
+                        aux_bgr = np.zeros((panel_h, panel_h, 3), dtype=np.uint8)
+                    cv2.putText(aux_bgr, label, (5, 18),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    panels.append(aux_bgr)
 
-                    # HUD overlay
-                    rec_text = f"[REC {recorder.num_steps}]" if recording else "[IDLE]"
-                    gp_text = "GP:OK" if receiver.is_connected else "GP:--"
-                    ee_pos = obs["policy"][0, 14:17].cpu().numpy()
-                    hud = f"{rec_text}  Ep:{episode_count}  {gp_text}  EE:[{ee_pos[0]:.2f},{ee_pos[1]:.2f},{ee_pos[2]:.2f}]"
-                    cv2.putText(display, hud, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                (0, 255, 0) if recording else (200, 200, 200), 1, cv2.LINE_AA)
+                # -- Stitch side-by-side --
+                display = np.hstack(panels)
 
-                    cv2.imshow("Teleop — DOBOT Nova 5", display)
-                    key = cv2.waitKey(1)
-                    if key == 27:  # ESC
-                        break
+                # -- HUD overlay --
+                rec_text = f"[REC {recorder.num_steps}]" if recording else "[IDLE]"
+                gp_text = "GP:OK" if receiver.is_connected else "GP:--"
+                ee_pos = obs["policy"][0, 14:17].cpu().numpy()
+                grip_text = "OPEN" if mapper.gripper_open else "CLOSED"
+                hud = f"{rec_text} Ep:{episode_count} {gp_text}  EE:[{ee_pos[0]:.2f},{ee_pos[1]:.2f},{ee_pos[2]:.2f}]  Grip:{grip_text}"
+                cv2.putText(display, hud, (10, display.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 255, 0) if recording else (200, 200, 200), 1, cv2.LINE_AA)
+
+                cv2.imshow(TELEOP_WIN, display)
+                key = cv2.waitKey(1)
+                if key == 27:  # ESC
+                    break
 
             # ---------- Print status ----------
             if step % (args.hz * 5) == 0 and step > 0:
