@@ -39,8 +39,8 @@
 
 ```bash
 # 3090 服务器端
-/home/zjf/IsaacLab/isaaclab.sh -p scripts/teleop_collect.py
+/home/zjf/IsaacLab/isaaclab.sh -p scripts/collect/teleop_collect.py
 
 # 本地 PC 端（连接手柄）
-python tools/gamepad_sender.py --ip <3090_TAILSCALE_IP>
+python tools/teleop/gamepad_sender.py --ip <3090_TAILSCALE_IP>
 ```
