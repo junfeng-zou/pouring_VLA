@@ -1,23 +1,59 @@
+# -----------------------------------------------------------------------------
 # Python
+# -----------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.Python
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
 
+# Type check / test / coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# -----------------------------------------------------------------------------
 # Virtual environments
+# -----------------------------------------------------------------------------
 .venv/
-venv/
-env/
-ENV/
+# 仅忽略仓库根目录下的虚拟环境目录，避免误伤 scripts/env/ 等源码目录
+/venv/
+/env/
+/ENV/
+.virtualenv/
 
-# Distribution / packaging
+# -----------------------------------------------------------------------------
+# Packaging / build
+# -----------------------------------------------------------------------------
 *.egg-info/
 *.egg
 dist/
 build/
 wheels/
+*.whl
 
-# IDE / Editor
+# -----------------------------------------------------------------------------
+# Secrets & local config (do not commit)
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+secrets.yaml
+secrets.yml
+
+# -----------------------------------------------------------------------------
+# IDE / editor (optional: remove .vscode/ line if you want shared launch.json)
+# -----------------------------------------------------------------------------
 .vscode/
 .idea/
 *.swp
@@ -26,31 +62,61 @@ wheels/
 .project
 .settings/
 
-# OS generated
+# -----------------------------------------------------------------------------
+# OS
+# -----------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Jupyter Notebook
+# -----------------------------------------------------------------------------
+# Jupyter
+# -----------------------------------------------------------------------------
 .ipynb_checkpoints/
+*.ipynb_checkpoints
 
-# Isaac Sim / NVIDIA
+# -----------------------------------------------------------------------------
+# Isaac Sim / NVIDIA Omniverse (local kit install or symlinks)
+# -----------------------------------------------------------------------------
 _isaac_sim/
 *.lock
 
-# Logs & outputs
+# -----------------------------------------------------------------------------
+# Weights, checkpoints, datasets (large — keep local / use Git LFS if you must)
+# -----------------------------------------------------------------------------
+checkpoints/
+data/
+assets/
+*.pdf
+*.hdf5
+*.h5
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.mlmodel
+
+# Fine-tuning runs (LoRA adapters, intermediate checkpoints, copied tokenizers)
+LoRA_train/runs/
+
+# Experiment tracking
+wandb/
+mlruns/
+lightning_logs/
+
+# Hugging Face download cache if created inside the repo
+**/.cache/
+
+# -----------------------------------------------------------------------------
+# Logs (keep small markdown logs in log/ if you track them — only ignore raw logs)
+# -----------------------------------------------------------------------------
 *.log
 logs/
 
-# Data & checkpoints
-data/vla_dataset/*.hdf5
-# checkpoints/
-# *.pth
-# *.ckpt
-# *.pt
-
-# Temporary files
+# -----------------------------------------------------------------------------
+# Misc temp
+# -----------------------------------------------------------------------------
 *.tmp
 *.bak
-
-assets/
+*.orig
