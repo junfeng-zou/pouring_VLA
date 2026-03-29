@@ -3,10 +3,10 @@ DOBOT Nova 5 — Pouring Environment Test Script
 =================================================
 
 Launch with:
-    /path/to/IsaacLab/isaaclab.sh -p scripts/run_pouring_env.py
+    /path/to/IsaacLab/isaaclab.sh -p scripts/env/run_pouring_env.py
 
     # headless mode:
-    /path/to/IsaacLab/isaaclab.sh -p scripts/run_pouring_env.py --headless
+    /path/to/IsaacLab/isaaclab.sh -p scripts/env/run_pouring_env.py --headless
 
 This script creates the PouringEnv, runs a simple sinusoidal motion
 on all joints, and prints observations / rewards at each step.
@@ -21,7 +21,7 @@ import os
 import torch
 
 # -- Make project root importable --
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from isaacsim import SimulationApp
 

@@ -22,9 +22,9 @@ from isaaclab.assets.articulation import ArticulationCfg
 # ── Resolve the USD asset path ─────────────────────────────────────────────
 # Relative to this script's location
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_DIR = os.path.dirname(_SCRIPT_DIR)
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", ".."))
 _USD_PATH = os.path.join(
-    _PROJECT_DIR,
+    _PROJECT_ROOT,
     "assets",
     "DOBOT Nova 5-20221011.SLDASM",
     "usd",
