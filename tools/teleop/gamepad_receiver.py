@@ -6,10 +6,10 @@ Gamepad UDP Receiver — 远程 3090 端
 线程安全的 UDP 手柄数据接收器，可嵌入 Isaac Lab 仿真循环。
 
 独立测试：
-    python gamepad_receiver.py --port 9876
+    python tools/teleop/gamepad_receiver.py --port 9876
 
 在 Isaac Lab 中使用：
-    from scripts.gamepad_receiver import GamepadReceiver
+    from tools.teleop.gamepad_receiver import GamepadReceiver
 
     receiver = GamepadReceiver(port=9876)
     receiver.start()

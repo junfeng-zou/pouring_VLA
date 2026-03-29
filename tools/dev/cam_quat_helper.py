@@ -13,10 +13,10 @@ Conventions:
 
 Usage:
     # Convert UI quaternion (w,x,y,z) to CameraCfg convention="world"
-    python tools/cam_quat_helper.py --from-ui  -0.5 -0.5 -0.5 0.5
+    python tools/dev/cam_quat_helper.py --from-ui  -0.5 -0.5 -0.5 0.5
 
     # Convert CameraCfg world quaternion to what UI should show (verify)
-    python tools/cam_quat_helper.py --to-ui  1.0 0.0 0.0 0.0
+    python tools/dev/cam_quat_helper.py --to-ui  1.0 0.0 0.0 0.0
 """
 
 import argparse

@@ -7,7 +7,7 @@ Gamepad UDP Sender — 本地 PC 端
 打包为 JSON 通过 UDP 发送到远程 3090。
 
 用法：
-    python gamepad_sender.py --ip <3090_TAILSCALE_IP> --port 9876
+    python tools/teleop/gamepad_sender.py --ip <3090_TAILSCALE_IP> --port 9876
 
 依赖：
     pip install pygame
