@@ -1,0 +1,172 @@
+"""
+Map-style PyTorch dataset: pouring_VLA HDF5 episodes -> OpenVLA training tensors.
+"""
+
+from __future__ import annotations
+
+import bisect
+import glob
+import json
+import os
+from typing import Any, Callable, Type
+
+import h5py
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+
+from action_tokenizer import ActionTokenizer
+from collator import IGNORE_INDEX
+from prompting_vicuna import PromptBuilder, VicunaV15ChatPromptBuilder
+
+
+def _decode_task(task_attr: Any) -> str:
+    if isinstance(task_attr, bytes):
+        return task_attr.decode("utf-8")
+    if isinstance(task_attr, np.ndarray) and task_attr.dtype.type is np.str_:
+        return str(task_attr.item())
+    return str(task_attr)
+
+
+def _list_hdf5_files(data_dir: str) -> list[str]:
+    paths = sorted(glob.glob(os.path.join(data_dir, "episode_*.hdf5")))
+    paths.extend(sorted(glob.glob(os.path.join(data_dir, "*.hdf5"))))
+    # De-dup (episode_*.hdf5 matched twice)
+    return sorted(set(paths))
+
+
+class PouringHDF5VLADataset(Dataset):
+    """
+    One sample = one (image, language, 7-DoF action) transition from HDF5.
+
+    Matches OpenVLA / RLDSBatchTransform label masking: only action (+ stop) tokens contribute loss.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        action_tokenizer: ActionTokenizer,
+        base_tokenizer,
+        image_transform: Callable,
+        prompt_builder_fn: Type[PromptBuilder] = VicunaV15ChatPromptBuilder,
+        predict_stop_token: bool = True,
+        action_dim: int = 7,
+    ) -> None:
+        super().__init__()
+        self.data_dir = os.path.abspath(data_dir)
+        self.action_tokenizer = action_tokenizer
+        self.base_tokenizer = base_tokenizer
+        self.image_transform = image_transform
+        self.prompt_builder_fn = prompt_builder_fn
+        self.predict_stop_token = predict_stop_token
+        self.action_dim = action_dim
+
+        files = _list_hdf5_files(self.data_dir)
+        if not files:
+            raise FileNotFoundError(f"No episode_*.hdf5 under {self.data_dir}")
+
+        self._episodes: list[tuple[str, int, str]] = []
+        for fp in files:
+            with h5py.File(fp, "r") as f:
+                actions = f["actions"]
+                if actions.shape[-1] != action_dim:
+                    raise ValueError(f"{fp}: expected actions[..., {action_dim}], got {actions.shape}")
+                t = int(actions.shape[0])
+                if t < 1:
+                    continue
+                lang = _decode_task(f.attrs["task"])
+            self._episodes.append((fp, t, lang))
+
+        if not self._episodes:
+            raise RuntimeError("No non-empty episodes found.")
+
+        self._cum: list[int] = [0]
+        for _, t, _ in self._episodes:
+            self._cum.append(self._cum[-1] + t)
+
+        self.dataset_statistics = self._compute_action_stats()
+
+    def _compute_action_stats(self) -> dict:
+        """OpenVLA-style stats blob for downstream denormalization (q01/q99 per dim)."""
+        actions_all: list[np.ndarray] = []
+        for fp, t, _ in self._episodes:
+            with h5py.File(fp, "r") as f:
+                actions_all.append(np.asarray(f["actions"][:], dtype=np.float32))
+        stacked = np.concatenate(actions_all, axis=0)
+        q01 = np.quantile(stacked, 0.01, axis=0).astype(np.float32)
+        q99 = np.quantile(stacked, 0.99, axis=0).astype(np.float32)
+        return {"pouring_hdf5": {"action": {"q01": q01.tolist(), "q99": q99.tolist()}}}
+
+    def __len__(self) -> int:
+        return self._cum[-1]
+
+    def _locate(self, idx: int) -> tuple[str, int, str]:
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        ep = bisect.bisect_right(self._cum, idx) - 1
+        t = idx - self._cum[ep]
+        path, T, lang = self._episodes[ep]
+        assert 0 <= t < T
+        return path, t, lang
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        path, t, default_lang = self._locate(idx)
+
+        with h5py.File(path, "r") as f:
+            rgb = np.asarray(f["observations/images/rgb"][t], dtype=np.uint8)
+            action = np.asarray(f["actions"][t], dtype=np.float32)
+            lang = _decode_task(f.attrs.get("task", default_lang))
+
+        if action.shape != (self.action_dim,):
+            raise RuntimeError(f"Bad action shape {action.shape} in {path} step {t}")
+
+        img = Image.fromarray(rgb)
+        pixel_values = self.image_transform(img)
+
+        lang_l = lang.lower()
+        tok = self.base_tokenizer
+        at = self.action_tokenizer
+
+        # 1) Text through ASSISTANT: only (no decode→encode round-trip for actions).
+        prompt_builder = self.prompt_builder_fn("openvla")
+        human_msg = f"<image>\nWhat action should the robot take to {lang_l}?"
+        prompt_builder.add_turn("human", human_msg)
+        text_prompt = prompt_builder.get_prompt()
+
+        input_ids = list(tok(text_prompt, add_special_tokens=True).input_ids)
+
+        # 2) Discrete action token IDs (same binning as ActionTokenizer, ids at vocab tail).
+        action_clip = np.clip(
+            action.astype(np.float64),
+            float(at.min_action),
+            float(at.max_action),
+        )
+        discretized = np.digitize(action_clip, at.bins)
+        action_token_ids = (tok.vocab_size - discretized).astype(np.int64).tolist()
+        assert len(action_token_ids) == self.action_dim
+
+        input_ids.extend(action_token_ids)
+        eos_id = tok.eos_token_id
+        if eos_id is None:
+            eos_id = getattr(tok, "pad_token_id", None) or 2
+        input_ids.append(int(eos_id))
+
+        # 3) Labels: supervise action tokens + EOS only.
+        labels = [IGNORE_INDEX] * len(input_ids)
+        n_sup = len(action_token_ids) + 1
+        labels[-n_sup:] = input_ids[-n_sup:]
+        if not self.predict_stop_token:
+            labels[-1] = IGNORE_INDEX
+
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
+    def save_dataset_statistics(self, run_dir: str) -> None:
+        os.makedirs(run_dir, exist_ok=True)
+        out = os.path.join(run_dir, "dataset_statistics.json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(self.dataset_statistics, f, indent=2)
