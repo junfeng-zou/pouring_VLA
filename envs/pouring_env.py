@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import math
+
+import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
@@ -54,29 +56,169 @@ _USD_PATH = os.path.join(
 # ---------------------------------------------------------------------------
 
 # -- Water (rigid sphere) parameters ----------------------------------------
-NUM_WATER_SPHERES = 50
+NUM_WATER_SPHERES = 80
 WATER_SPHERE_RADIUS = 0.008  # 8 mm
 WALL_THICKNESS = 0.004       # container wall thickness
 GRIPPER_MAX_OPEN = 0.055     # max finger travel (must match URDF upper limit)
 
 # -- Geometry ---------------------------------------------------------------
-TABLE_SIZE = (1.2, 0.8, 0.75)  # length, width, height
-TABLE_POS = (0.3, 0.0, TABLE_SIZE[2] / 2.0)  # robot at x=0, table extends from x=-0.3 to x=0.9
+TABLE_SIZE = (2.0, 1.6, 0.75)  # length, width, height (X length doubled)
+# Keep +X edge unchanged while extending only toward -X:
+# old X span [-0.3, 0.9] -> new X span [-1.5, 0.9]
+TABLE_POS = (-0.3, 0.0, TABLE_SIZE[2] / 2.0)  # robot at x=0, table extends from x=-1.5 to x=0.9
 
 CUP_RADIUS = 0.04
 CUP_HEIGHT = 0.10
-CUP_POS = (0.5, 0.0, TABLE_SIZE[2] + CUP_HEIGHT / 2.0)
+CUP_POS = (-0.224, -0.410, TABLE_SIZE[2] + CUP_HEIGHT / 2.0)
 
-BOTTLE_RADIUS = 0.035
+BOTTLE_RADIUS = 0.03
 BOTTLE_HEIGHT = 0.20
-BOTTLE_POS = (0.5, 0.3, TABLE_SIZE[2] + BOTTLE_HEIGHT / 2.0)  # on the table, offset from cup in Y
+BOTTLE_POS = (-0.224, -0.290, TABLE_SIZE[2] + BOTTLE_HEIGHT / 2.0)  # near cup, ~12cm offset
+
+# Second bottle (Sprite-like green), decorative / distractor; no liquid inside.
+SPRITE_BOTTLE_POS = (-0.08, -0.52, TABLE_SIZE[2] + BOTTLE_HEIGHT / 2.0)
+SPRITE_BOTTLE_COLOR = (0.22, 0.78, 0.32)  # lime / Sprite-like green
+
+# Tabletop XY bounds (local frame) for random placement — inside table with margin.
+_TABLE_X_HALF = TABLE_SIZE[0] * 0.5
+_TABLE_Y_HALF = TABLE_SIZE[1] * 0.5
+_TABLE_MARGIN = 0.10
+TABLE_XY_XMIN = TABLE_POS[0] - _TABLE_X_HALF + _TABLE_MARGIN + CUP_RADIUS
+TABLE_XY_XMAX = TABLE_POS[0] + _TABLE_X_HALF - _TABLE_MARGIN - CUP_RADIUS
+TABLE_XY_YMIN = TABLE_POS[1] - _TABLE_Y_HALF + _TABLE_MARGIN + CUP_RADIUS
+TABLE_XY_YMAX = TABLE_POS[1] + _TABLE_Y_HALF - _TABLE_MARGIN - CUP_RADIUS
+
+# IK joint sign convention correction (joint_1..joint_6).
+# User-observed convention: all reversed except joint_3.
+# We apply this in IK space so Cartesian control follows the expected positive directions.
+IK_JOINT_SIGN = (-1.0, -1.0, 1.0, -1.0, -1.0, -1.0)
+
+
+def _quat_wxyz_to_rotmat_torch(q: torch.Tensor) -> torch.Tensor:
+    """Convert batched quaternions (w, x, y, z) to rotation matrices."""
+    w, x, y, z = q.unbind(dim=-1)
+    R = torch.empty(q.shape[0], 3, 3, device=q.device, dtype=q.dtype)
+    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+    R[:, 0, 1] = 2 * (x * y - w * z)
+    R[:, 0, 2] = 2 * (x * z + w * y)
+    R[:, 1, 0] = 2 * (x * y + w * z)
+    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+    R[:, 1, 2] = 2 * (y * z - w * x)
+    R[:, 2, 0] = 2 * (x * z - w * y)
+    R[:, 2, 1] = 2 * (y * z + w * x)
+    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+    return R
+
+
+def _quat_wxyz_to_rotmat_np(q: np.ndarray) -> np.ndarray:
+    """Single quaternion (w, x, y, z) → 3×3 rotation matrix (numpy)."""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _debug_make_arrow_curve(stage, path: str, color_rgb: tuple[float, float, float]):
+    """One line strip for EE axis debug (UsdGeom.BasisCurves)."""
+    from pxr import Gf, UsdGeom
+
+    curve = UsdGeom.BasisCurves.Define(stage, path)
+    curve.CreateTypeAttr("linear")
+    curve.CreateCurveVertexCountsAttr([2])
+    curve.CreatePointsAttr([Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(0.0, 0.0, 0.0)])
+    curve.CreateWidthsAttr([0.006])
+    curve.CreateDisplayColorAttr(
+        [Gf.Vec3f(float(color_rgb[0]), float(color_rgb[1]), float(color_rgb[2]))]
+    )
+    return curve
+
+
+def _debug_create_ee_frame_curves(stage, parent_path: str) -> dict:
+    """RGB 三轴箭头：X 红、Y 绿、Z 蓝（末端 link_6 体坐标系在世界里）。"""
+    from pxr import UsdGeom
+
+    if not stage.GetPrimAtPath(parent_path).IsValid():
+        UsdGeom.Xform.Define(stage, parent_path)
+    curves: dict[str, dict[str, object]] = {}
+    for stem, rgb in (
+        ("axis_x", (1.0, 0.0, 0.0)),
+        ("axis_y", (0.0, 1.0, 0.0)),
+        ("axis_z", (0.0, 0.0, 1.0)),
+    ):
+        base = f"{parent_path}/{stem}"
+        curves[stem] = {
+            "shaft": _debug_make_arrow_curve(stage, f"{base}_shaft", rgb),
+            "head_l": _debug_make_arrow_curve(stage, f"{base}_head_l", rgb),
+            "head_r": _debug_make_arrow_curve(stage, f"{base}_head_r", rgb),
+        }
+    return curves
+
+
+def _debug_update_ee_frame_curves(
+    curves: dict,
+    origin: np.ndarray,
+    r_world_from_ee: np.ndarray,
+    axis_length: float,
+) -> None:
+    from pxr import Gf
+
+    up_hint = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    side_hint = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    local_dirs = {
+        "axis_x": np.array([1.0, 0.0, 0.0]),
+        "axis_y": np.array([0.0, 1.0, 0.0]),
+        "axis_z": np.array([0.0, 0.0, 1.0]),
+    }
+    for stem, local in local_dirs.items():
+        if stem not in curves:
+            continue
+        axis_dir = r_world_from_ee @ local
+        n = float(np.linalg.norm(axis_dir))
+        if n < 1e-9:
+            continue
+        axis_dir = axis_dir / n
+        o = origin.astype(np.float64, copy=False)
+        end = o + axis_length * axis_dir
+        tangent = np.cross(axis_dir, up_hint)
+        if np.linalg.norm(tangent) < 1e-6:
+            tangent = np.cross(axis_dir, side_hint)
+        tangent = tangent / max(float(np.linalg.norm(tangent)), 1e-8)
+        head_len = axis_length * 0.22
+        head_w = axis_length * 0.10
+        left = end - head_len * axis_dir + head_w * tangent
+        right = end - head_len * axis_dir - head_w * tangent
+        c = curves[stem]
+        c["shaft"].GetPointsAttr().Set(
+            [
+                Gf.Vec3f(float(o[0]), float(o[1]), float(o[2])),
+                Gf.Vec3f(float(end[0]), float(end[1]), float(end[2])),
+            ]
+        )
+        c["head_l"].GetPointsAttr().Set(
+            [
+                Gf.Vec3f(float(end[0]), float(end[1]), float(end[2])),
+                Gf.Vec3f(float(left[0]), float(left[1]), float(left[2])),
+            ]
+        )
+        c["head_r"].GetPointsAttr().Set(
+            [
+                Gf.Vec3f(float(end[0]), float(end[1]), float(end[2])),
+                Gf.Vec3f(float(right[0]), float(right[1]), float(right[2])),
+            ]
+        )
+
 
 @configclass
 class PouringEnvCfg(DirectRLEnvCfg):
     """Configuration for the DOBOT Nova 5 pouring environment."""
 
     # -- env --
-    episode_length_s = 120.0
+    episode_length_s = 240.0
     decimation = 2
     action_space = 7       # 3 EE position deltas + 3 EE orientation deltas + 1 gripper
     observation_space = 20  # 6 jpos + 6 jvel + 2 gripper_pos + 3 ee_pos + 3 cup_pos
@@ -102,49 +244,50 @@ class PouringEnvCfg(DirectRLEnvCfg):
         replicate_physics=True,
     )
 
-    # -- third-person camera (Orbbec Femto Bolt RGB mode) --
-    # Femto Bolt RGB: 1920x1080, HFOV ≈ 80°
+    # -- data collection camera (mounted relative to robot base frame) --
     camera = CameraCfg(
-        prim_path="/World/envs/env_.*/Camera",
+        prim_path="/World/envs/env_.*/Robot/MainCamera",
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=12.49,
-            horizontal_aperture=20.955,
+            # Approximate Orbbec Femto Bolt RGB intrinsics:
+            # HFOV ~79-80 deg with 16:9 aspect.
+            focal_length=2.80,
+            horizontal_aperture=4.80,
             clipping_range=(0.1, 10.0),
         ),
         offset=CameraCfg.OffsetCfg(
-            # pos=(0.56, 0.01, 1.67),
-            pos=(0.81, 0.15, 0.96),             # in front of workspace
-            rot=(0.0000, 0.0000, 0.0000, 1.0000),   # 90° around Y → look along -X
-            # rot=(0, 0, 0.34645, 0.93807),  # (w, x, y, z)
+            pos=(-0.8, -0.56, 0.34),
+            # Yaw +45deg in parent (robot-base) frame:
+            # camera heading aligns with the bisector of +X and +Y.
+            # rot=(1, 0, 0, 0.),
+            rot=(0.9811, -0.0000, 0.1934, 0.0000),
             convention="world",
         ),
-        width=640,
-        height=360,
+        # Femto Bolt RGB commonly used at 1280x720.
+        width=1280,
+        height=720,
         data_types=["rgb", "distance_to_image_plane"],
-        update_period=0.1,
+        # 0 = 每仿真步刷新；固定 30Hz 时可能与策略读帧相位耦合导致长时间读到同一 buffer
+        update_period=0.0,
     )
 
-    # cam_top removed for performance
-
-    # Side-view camera: from the front, looking back at workspace
-    # 90° rotation around Y: camera -Z → world -X (looking toward table)
+    # Operator guidance camera (overhead angle)
     cam_side = CameraCfg(
-        prim_path="/World/envs/env_.*/CamSide",
+        prim_path="/World/envs/env_.*/Robot/CamSide",
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=8.0,
-            horizontal_aperture=20.955,
+            focal_length=2.80,
+            horizontal_aperture=4.80,
             clipping_range=(0.1, 10.0),
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.56, 0.636, 1.54),
-            rot=(-0.6423, -0.2958, -0.2958, 0.6423),  # (w, x, y, z)
-            # rot=(0.5, 0.5, 0.5, 0.5),   # 90° around Y → look along -X
+            pos=(0, -0.8, 0.5),
+            # rot=(0.5897, -0.1237, 0.0920, 0.7928),
+            rot=(0.5742, -0.1824, 0.1713, 0.7795),
             convention="world",
         ),
-        width=640,
-        height=480,
+        width=1280,
+        height=720,
         data_types=["rgb"],
-        update_period=0.1,
+        update_period=1.0 / 30.0,
     )
 
     # -- robot --
@@ -165,12 +308,18 @@ class PouringEnvCfg(DirectRLEnvCfg):
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(0.0, 0.0, TABLE_SIZE[2]),  # on the table surface
             joint_pos={
-                "joint_1": 0.0,
-                "joint_2": 0.0,
-                "joint_3": -1.5708,   # elbow up
-                "joint_4": 0.0,
-                "joint_5": -1.5708,  # wrist down
-                "joint_6": 0.0,
+                "joint_1": -0.6020,
+                "joint_2": -0.2310,
+                "joint_3": 2.1043,   # elbow up
+                "joint_4": 0.7646,
+                "joint_5": 1.5708,  # wrist down
+                "joint_6": 4.2412e-04,
+                # "joint_1": 0,
+                # "joint_2": 0,
+                # "joint_3": 0,   # elbow up
+                # "joint_4": 0,
+                # "joint_5": 0,
+                # "joint_6": 0,
                 "finger_left_joint": GRIPPER_MAX_OPEN,   # open
                 "finger_right_joint": GRIPPER_MAX_OPEN,  # open
             },
@@ -249,6 +398,27 @@ class PouringEnvCfg(DirectRLEnvCfg):
     # -- action scale --
     pos_action_scale = 0.005   # meters per step (for EE position)
     rot_action_scale = 0.01    # radians per step (for EE orientation)
+    teleop_delta_frame = "ee"  # "ee": deltas interpreted in end-effector frame
+
+    # -- debug visualization (USD BasisCurves; link_6 body frame: X红 Y绿 Z蓝) --
+    debug_visualize_ee_frame: bool = False
+    debug_ee_frame_axis_length: float = 0.15  # meters
+    debug_ee_frame_prim_path: str = "/World/DebugEEFrame"
+
+    # -- position randomization (for data diversity) --
+    randomize_positions = True
+    # Moderate patch around default layout (~-0.22, -0.35) so MainCamera still sees cup + both bottles.
+    # Box diagonal ~0.54 m — enough for max_cup_bottle_dist=0.50. Clamped to TABLE_XY_* in _sample_*.
+    cup_pos_x_range = (-0.43, -0.02)
+    cup_pos_y_range = (-0.58, -0.22)
+    bottle_pos_x_range = (-0.43, -0.02)
+    bottle_pos_y_range = (-0.58, -0.22)
+    sprite_bottle_pos_x_range = (-0.43, -0.02)
+    sprite_bottle_pos_y_range = (-0.58, -0.22)
+    min_cup_bottle_dist = 0.10
+    max_cup_bottle_dist = 0.50
+    # Sprite bottle must not overlap cup / cola bottle centers too closely.
+    min_sprite_sep_dist = 0.12
 
 
 # ---------------------------------------------------------------------------
@@ -305,12 +475,17 @@ class PouringEnv(DirectRLEnv):
         else:
             self._ee_jacobi_idx = self._robot_entity_cfg.body_ids[0]
 
-        # Cup position (fixed, per env)
-        self.cup_pos = torch.tensor(
+        # Cup position (local coords, updated on reset if randomization is enabled)
+        self.cup_pos_local = torch.tensor(
             [CUP_POS] * self.num_envs, device=self.device, dtype=torch.float32
         )
-        # Adjust for env origins
-        self.cup_pos += self.scene.env_origins
+        # Bottle position (local coords, updated on reset)
+        self.bottle_pos_local = torch.tensor(
+            [BOTTLE_POS] * self.num_envs, device=self.device, dtype=torch.float32
+        )
+        self.sprite_bottle_pos_local = torch.tensor(
+            [SPRITE_BOTTLE_POS] * self.num_envs, device=self.device, dtype=torch.float32
+        )
 
         # Water tracking
         self.num_water = NUM_WATER_SPHERES
@@ -318,6 +493,20 @@ class PouringEnv(DirectRLEnv):
 
         # PhysX view for bottle — created lazily on first reset
         self._bottle_physx_view = None
+
+        # Optional: RGB axis arrows at end-effector (link_6)
+        self._ee_frame_curves: dict | None = None
+        if cfg.debug_visualize_ee_frame:
+            try:
+                import omni.usd
+
+                stage = omni.usd.get_context().get_stage()
+                self._ee_frame_curves = _debug_create_ee_frame_curves(
+                    stage, cfg.debug_ee_frame_prim_path
+                )
+            except Exception as exc:
+                self._ee_frame_curves = None
+                print(f"[PouringEnv] debug_visualize_ee_frame 初始化失败: {exc}")
 
     def _setup_scene(self):
         """Create the full scene: robot, table, cup, bottle, water, lights."""
@@ -355,35 +544,78 @@ class PouringEnv(DirectRLEnv):
             stage, "/World/envs/env_0/Bottle",
             radius=BOTTLE_RADIUS, height=BOTTLE_HEIGHT,
             thickness=WALL_THICKNESS,
-            color=(0.1, 0.3, 0.8),
+            color=(0.12, 0.05, 0.02),  # cola-like very dark brown
             position=BOTTLE_POS,
             kinematic=False,  # dynamic — can be grasped and moved
             mass=0.3,         # 300g bottle
         )
         self._bottle_prim_path = "/World/envs/env_0/Bottle"
 
-        # Wrap the bottle as an Isaac Lab RigidObject so we can use
-        # write_root_pose_to_sim() for proper physics-level reset.
-        # spawn=None because the prim already exists from _create_hollow_container.
+        self._create_hollow_container(
+            stage, "/World/envs/env_0/BottleSprite",
+            radius=BOTTLE_RADIUS, height=BOTTLE_HEIGHT,
+            thickness=WALL_THICKNESS,
+            color=SPRITE_BOTTLE_COLOR,
+            position=SPRITE_BOTTLE_POS,
+            kinematic=False,
+            mass=0.3,
+        )
+
+        # Wrap cup and bottle as RigidObjects for physics-level repositioning.
+        # spawn=None because prims already exist from _create_hollow_container.
+        cup_cfg = RigidObjectCfg(
+            prim_path="/World/envs/env_.*/Cup",
+            spawn=None,
+            init_state=RigidObjectCfg.InitialStateCfg(pos=CUP_POS),
+        )
+        self._cup_obj = RigidObject(cup_cfg)
+        self.scene.rigid_objects["cup"] = self._cup_obj
+
         bottle_cfg = RigidObjectCfg(
             prim_path="/World/envs/env_.*/Bottle",
             spawn=None,
-            init_state=RigidObjectCfg.InitialStateCfg(
-                pos=BOTTLE_POS,
-            ),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=BOTTLE_POS),
         )
         self._bottle_obj = RigidObject(bottle_cfg)
         self.scene.rigid_objects["bottle"] = self._bottle_obj
 
+        sprite_bottle_cfg = RigidObjectCfg(
+            prim_path="/World/envs/env_.*/BottleSprite",
+            spawn=None,
+            init_state=RigidObjectCfg.InitialStateCfg(pos=SPRITE_BOTTLE_POS),
+        )
+        self._sprite_bottle_obj = RigidObject(sprite_bottle_cfg)
+        self.scene.rigid_objects["bottle_sprite"] = self._sprite_bottle_obj
+
         # -- Water spheres --
-        # We spawn them individually with unique prim paths
+        # Concentric-ring packing: 1 center + 6 ring = 7 balls per layer.
+        # This keeps all 80 spheres inside the bottle.
+        _inner_r = BOTTLE_RADIUS - WALL_THICKNESS - WATER_SPHERE_RADIUS  # ~0.018
+        _n_ring = 6
+        _bpl = 1 + _n_ring  # balls per layer = 7
+        _layer_sp = WATER_SPHERE_RADIUS * 2.0  # vertical layer spacing = diameter
+        _bx, _by, _bz = BOTTLE_POS
+        _bot_z = _bz - BOTTLE_HEIGHT / 2.0 + WALL_THICKNESS + WATER_SPHERE_RADIUS
+
         self._water_spheres: list[RigidObject] = []
         for i in range(NUM_WATER_SPHERES):
+            layer = i // _bpl
+            pos_in_layer = i % _bpl
+            sz = _bot_z + layer * _layer_sp
+            if pos_in_layer == 0:
+                dx, dy = 0.0, 0.0
+            else:
+                angle = 2 * math.pi * (pos_in_layer - 1) / _n_ring
+                if layer % 2 == 1:  # offset alternate layers for hex packing
+                    angle += math.pi / _n_ring
+                dx = _inner_r * math.cos(angle)
+                dy = _inner_r * math.sin(angle)
+
             water_cfg = RigidObjectCfg(
                 prim_path=f"/World/envs/env_.*/Water_{i:03d}",
                 spawn=self.cfg.water_sphere.spawn,
                 init_state=RigidObjectCfg.InitialStateCfg(
-                    pos=(0.0, 0.0, 0.65 + i * WATER_SPHERE_RADIUS * 2.5),
+                    pos=(_bx + dx, _by + dy, sz),
                 ),
             )
             water_obj = RigidObject(water_cfg)
@@ -516,8 +748,16 @@ class PouringEnv(DirectRLEnv):
                 ee_pose_w[:, 0:3], ee_pose_w[:, 3:7],
             )
 
-            # Set IK command (relative delta)
-            self._ik_controller.set_command(cart_delta, ee_pos=ee_pos_b, ee_quat=ee_quat_b)
+            # Set IK command (relative delta).
+            # For teleoperation, interpret deltas in EE frame and convert to base frame.
+            if self.cfg.teleop_delta_frame == "ee":
+                R_ee_to_base = _quat_wxyz_to_rotmat_torch(ee_quat_b)
+                dpos_base = torch.bmm(R_ee_to_base, cart_delta[:, 0:3].unsqueeze(-1)).squeeze(-1)
+                drot_base = torch.bmm(R_ee_to_base, cart_delta[:, 3:6].unsqueeze(-1)).squeeze(-1)
+                cart_delta_cmd = torch.cat([dpos_base, drot_base], dim=-1)
+            else:
+                cart_delta_cmd = cart_delta
+            self._ik_controller.set_command(cart_delta_cmd, ee_pos=ee_pos_b, ee_quat=ee_quat_b)
 
             # Get Jacobian and current arm joint positions
             jacobian = self._robot.root_physx_view.get_jacobians()[
@@ -525,15 +765,22 @@ class PouringEnv(DirectRLEnv):
             ]
             arm_joint_pos = self._robot.data.joint_pos[:, self._robot_entity_cfg.joint_ids]
 
+            # Convert to corrected joint-sign convention:
+            # q_conv = S q_raw,  J_conv = J_raw S, where S=diag(IK_JOINT_SIGN).
+            sign = torch.tensor(IK_JOINT_SIGN, device=self.device, dtype=arm_joint_pos.dtype).view(1, -1)
+            jacobian_conv = jacobian * sign.view(1, 1, -1)
+            arm_joint_pos_conv = arm_joint_pos * sign
+
             # Compute IK: returns actual_pos + delta
-            arm_joint_targets = self._ik_controller.compute(
-                ee_pos_b, ee_quat_b, jacobian, arm_joint_pos
+            arm_joint_targets_conv = self._ik_controller.compute(
+                ee_pos_b, ee_quat_b, jacobian_conv, arm_joint_pos_conv
             )
 
             # Extract pure delta and apply to PREVIOUS TARGETS (not actual pos).
             # This prevents "accepting" gravity drift on each input step.
             joint_ids = self._robot_entity_cfg.joint_ids
-            ik_delta = arm_joint_targets - arm_joint_pos  # pure IK delta
+            ik_delta_conv = arm_joint_targets_conv - arm_joint_pos_conv  # pure IK delta (conv-space)
+            ik_delta = ik_delta_conv * sign  # map back to raw joint convention
             for i in range(self.num_envs):
                 if has_input[i]:
                     self.robot_dof_targets[i, joint_ids] += ik_delta[i]
@@ -559,41 +806,45 @@ class PouringEnv(DirectRLEnv):
 
     def _get_observations(self) -> dict:
         """Observation: arm_jpos(6) + arm_jvel(6) + gripper_pos(2) + EE_pos(3) + cup_pos(3) = 20."""
+        if self._ee_frame_curves is not None:
+            try:
+                pos_w = self._robot.data.body_pos_w[0, self.ee_link_idx].detach().cpu().numpy()
+                quat_w = self._robot.data.body_quat_w[0, self.ee_link_idx].detach().cpu().numpy()
+                R = _quat_wxyz_to_rotmat_np(quat_w)
+                _debug_update_ee_frame_curves(
+                    self._ee_frame_curves,
+                    pos_w,
+                    R,
+                    float(self.cfg.debug_ee_frame_axis_length),
+                )
+            except Exception:
+                pass
+
         joint_pos = self._robot.data.joint_pos
         joint_vel = self._robot.data.joint_vel
 
-        # End-effector position in world frame
         ee_pos_w = self._robot.data.body_pos_w[:, self.ee_link_idx]
 
-        # Cup position (subtract env origin to get local coords)
-        cup_pos_local = torch.tensor(
-            [CUP_POS] * self.num_envs, device=self.device, dtype=torch.float32
-        )
-
         obs = torch.cat([
-            joint_pos[:, :6],                   # (N, 6), arm joint positions
-            joint_vel[:, :6] * 0.1,             # (N, 6), arm joint velocities, scaled
-            joint_pos[:, 6:8],                  # (N, 2), gripper finger positions
-            ee_pos_w - self.scene.env_origins,   # (N, 3), local EE pos
-            cup_pos_local,                       # (N, 3), local cup pos
+            joint_pos[:, :6],                    # (N, 6)
+            joint_vel[:, :6] * 0.1,              # (N, 6)
+            joint_pos[:, 6:8],                   # (N, 2)
+            ee_pos_w - self.scene.env_origins,   # (N, 3)
+            self.cup_pos_local,                  # (N, 3) — randomized per reset
         ], dim=-1)
 
         return {"policy": torch.clamp(obs, -5.0, 5.0)}
 
     def _get_rewards(self) -> torch.Tensor:
         """Reward based on water spheres reaching the cup region."""
-        # Count water spheres inside the cup region
-        cup_center_xy = torch.tensor(
-            [[CUP_POS[0], CUP_POS[1]]] * self.num_envs, device=self.device
-        )
-        cup_top_z = CUP_POS[2] + CUP_HEIGHT / 2.0
+        cup_center_xy = self.cup_pos_local[:, :2]  # (N, 2) — randomized
+        cup_top_z = self.cup_pos_local[:, 2] + CUP_HEIGHT / 2.0  # (N,)
 
         water_in_cup = torch.zeros(self.num_envs, device=self.device)
         for water_obj in self._water_spheres:
-            w_pos = water_obj.data.root_pos_w  # (num_envs, 3)
+            w_pos = water_obj.data.root_pos_w
             w_pos_local = w_pos - self.scene.env_origins
 
-            # Check if sphere is within cup XY radius and below cup top Z
             dist_xy = torch.norm(w_pos_local[:, :2] - cup_center_xy, dim=-1)
             in_cup_xy = dist_xy < CUP_RADIUS
             in_cup_z = (w_pos_local[:, 2] > TABLE_SIZE[2]) & (w_pos_local[:, 2] < cup_top_z + 0.05)
@@ -626,13 +877,14 @@ class PouringEnv(DirectRLEnv):
         return terminated, truncated
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset specified environments."""
+        """Reset specified environments with optional position randomization."""
         super()._reset_idx(env_ids)
+        n = len(env_ids)
 
         # Reset robot joints
         joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
             -0.05, 0.05,
-            (len(env_ids), self._robot.num_joints),
+            (n, self._robot.num_joints),
             self.device,
         )
         joint_pos = torch.clamp(joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
@@ -641,42 +893,147 @@ class PouringEnv(DirectRLEnv):
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.robot_dof_targets[env_ids] = joint_pos
 
-        # Reset bottle (dynamic rigid body) using RigidObject API
-        bottle_pos = torch.tensor(
-            [BOTTLE_POS], device=self.device, dtype=torch.float32
-        ).repeat(len(env_ids), 1)
-        bottle_pos += self.scene.env_origins[env_ids]
-        bottle_quat = torch.tensor(
-            [[1.0, 0.0, 0.0, 0.0]], device=self.device
-        ).repeat(len(env_ids), 1)
-        bottle_vel = torch.zeros((len(env_ids), 6), device=self.device)
+        # --- Randomize or use default cup / bottle positions ---
+        table_z = TABLE_SIZE[2]
+        if self.cfg.randomize_positions:
+            cup_xy, bottle_xy, sprite_xy = self._sample_cup_bottle_sprite_positions(n)
+        else:
+            cup_xy = torch.tensor([[CUP_POS[0], CUP_POS[1]]], device=self.device).repeat(n, 1)
+            bottle_xy = torch.tensor([[BOTTLE_POS[0], BOTTLE_POS[1]]], device=self.device).repeat(n, 1)
+            sprite_xy = torch.tensor([[SPRITE_BOTTLE_POS[0], SPRITE_BOTTLE_POS[1]]], device=self.device).repeat(n, 1)
+
+        # Update stored local positions
+        self.cup_pos_local[env_ids, 0] = cup_xy[:, 0]
+        self.cup_pos_local[env_ids, 1] = cup_xy[:, 1]
+        self.cup_pos_local[env_ids, 2] = table_z + CUP_HEIGHT / 2.0
+
+        self.bottle_pos_local[env_ids, 0] = bottle_xy[:, 0]
+        self.bottle_pos_local[env_ids, 1] = bottle_xy[:, 1]
+        self.bottle_pos_local[env_ids, 2] = table_z + BOTTLE_HEIGHT / 2.0
+
+        self.sprite_bottle_pos_local[env_ids, 0] = sprite_xy[:, 0]
+        self.sprite_bottle_pos_local[env_ids, 1] = sprite_xy[:, 1]
+        self.sprite_bottle_pos_local[env_ids, 2] = table_z + BOTTLE_HEIGHT / 2.0
+
+        # --- Reset cup (kinematic) ---
+        cup_pos_w = self.cup_pos_local[env_ids].clone()
+        cup_pos_w += self.scene.env_origins[env_ids]
+        identity_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device).repeat(n, 1)
+        self._cup_obj.write_root_pose_to_sim(
+            torch.cat([cup_pos_w, identity_quat], dim=-1), env_ids=env_ids
+        )
+
+        # --- Reset bottle (dynamic) ---
+        bottle_pos_w = self.bottle_pos_local[env_ids].clone()
+        bottle_pos_w += self.scene.env_origins[env_ids]
+        bottle_vel = torch.zeros((n, 6), device=self.device)
         self._bottle_obj.write_root_pose_to_sim(
-            torch.cat([bottle_pos, bottle_quat], dim=-1), env_ids=env_ids
+            torch.cat([bottle_pos_w, identity_quat], dim=-1), env_ids=env_ids
         )
         self._bottle_obj.write_root_velocity_to_sim(bottle_vel, env_ids=env_ids)
 
-        # Reset water spheres — arrange inside the bottle
-        bottle_x, bottle_y, bottle_z = BOTTLE_POS
-        bottle_bottom_z = bottle_z - BOTTLE_HEIGHT / 2.0 + WALL_THICKNESS + WATER_SPHERE_RADIUS
-        for i, water_obj in enumerate(self._water_spheres):
-            # Spiral arrangement inside bottle
-            angle = (i / NUM_WATER_SPHERES) * 2 * math.pi * 5
-            r = BOTTLE_RADIUS * 0.5 * ((i % 5) / 5.0)
-            dx = r * math.cos(angle)
-            dy = r * math.sin(angle)
-            dz = bottle_bottom_z + (i // 5) * WATER_SPHERE_RADIUS * 2.5
+        # --- Reset Sprite bottle (dynamic, empty) ---
+        sprite_pos_w = self.sprite_bottle_pos_local[env_ids].clone()
+        sprite_pos_w += self.scene.env_origins[env_ids]
+        self._sprite_bottle_obj.write_root_pose_to_sim(
+            torch.cat([sprite_pos_w, identity_quat], dim=-1), env_ids=env_ids
+        )
+        self._sprite_bottle_obj.write_root_velocity_to_sim(bottle_vel, env_ids=env_ids)
 
-            w_pos = torch.tensor(
-                [[bottle_x + dx, bottle_y + dy, dz]],
-                device=self.device
-            ).repeat(len(env_ids), 1)
-            w_pos += self.scene.env_origins[env_ids]
-            w_rot = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device).repeat(len(env_ids), 1)
-            w_vel = torch.zeros((len(env_ids), 6), device=self.device)
-            water_obj.write_root_pose_to_sim(
-                torch.cat([w_pos, w_rot], dim=-1), env_ids=env_ids
-            )
-            water_obj.write_root_velocity_to_sim(w_vel, env_ids=env_ids)
+        # --- Reset water spheres inside the new bottle position ---
+        inner_r = BOTTLE_RADIUS - WALL_THICKNESS - WATER_SPHERE_RADIUS
+        n_ring = 6
+        balls_per_layer = 1 + n_ring
+        layer_spacing = WATER_SPHERE_RADIUS * 2.0
+        zero_vel = torch.zeros((n, 6), device=self.device)
+
+        for env_local_idx in range(n):
+            eid = env_ids[env_local_idx]
+            bx = self.bottle_pos_local[eid, 0].item()
+            by = self.bottle_pos_local[eid, 1].item()
+            bz = self.bottle_pos_local[eid, 2].item()
+            bot_z = bz - BOTTLE_HEIGHT / 2.0 + WALL_THICKNESS + WATER_SPHERE_RADIUS
+
+            for i, water_obj in enumerate(self._water_spheres):
+                layer = i // balls_per_layer
+                pos_in_layer = i % balls_per_layer
+                sz = bot_z + layer * layer_spacing
+                if pos_in_layer == 0:
+                    dx, dy = 0.0, 0.0
+                else:
+                    angle = 2 * math.pi * (pos_in_layer - 1) / n_ring
+                    if layer % 2 == 1:
+                        angle += math.pi / n_ring
+                    dx = inner_r * math.cos(angle)
+                    dy = inner_r * math.sin(angle)
+
+                w_pos = torch.tensor(
+                    [[bx + dx, by + dy, sz]], device=self.device
+                )
+                w_pos += self.scene.env_origins[eid:eid+1]
+                w_rot = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device)
+                single_eid = env_ids[env_local_idx:env_local_idx+1]
+                water_obj.write_root_pose_to_sim(
+                    torch.cat([w_pos, w_rot], dim=-1), env_ids=single_eid
+                )
+                water_obj.write_root_velocity_to_sim(
+                    zero_vel[env_local_idx:env_local_idx+1], env_ids=single_eid
+                )
 
         # Reset counters
         self.water_in_cup_count[env_ids] = 0
+
+    def _clamp_xy_to_table(self, x: float, y: float) -> tuple[float, float]:
+        return (
+            min(max(x, TABLE_XY_XMIN), TABLE_XY_XMAX),
+            min(max(y, TABLE_XY_YMIN), TABLE_XY_YMAX),
+        )
+
+    def _sample_cup_bottle_sprite_positions(self, n: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample cup, cola bottle, and Sprite bottle XY on the table.
+
+        Cup–cola distance in [min_cup_bottle_dist, max_cup_bottle_dist].
+        Sprite kept at least min_sprite_sep_dist from both.
+        """
+        cfg = self.cfg
+        max_attempts = 120
+
+        cup_xy = torch.zeros(n, 2, device=self.device)
+        bottle_xy = torch.zeros(n, 2, device=self.device)
+        sprite_xy = torch.zeros(n, 2, device=self.device)
+
+        for i in range(n):
+            ok = False
+            for _ in range(max_attempts):
+                cx = sample_uniform(cfg.cup_pos_x_range[0], cfg.cup_pos_x_range[1], (1, 1), self.device).item()
+                cy = sample_uniform(cfg.cup_pos_y_range[0], cfg.cup_pos_y_range[1], (1, 1), self.device).item()
+                cx, cy = self._clamp_xy_to_table(cx, cy)
+                bx = sample_uniform(cfg.bottle_pos_x_range[0], cfg.bottle_pos_x_range[1], (1, 1), self.device).item()
+                by = sample_uniform(cfg.bottle_pos_y_range[0], cfg.bottle_pos_y_range[1], (1, 1), self.device).item()
+                bx, by = self._clamp_xy_to_table(bx, by)
+                dist_cb = math.hypot(cx - bx, cy - by)
+                if not (cfg.min_cup_bottle_dist <= dist_cb <= cfg.max_cup_bottle_dist):
+                    continue
+                sx = sample_uniform(
+                    cfg.sprite_bottle_pos_x_range[0], cfg.sprite_bottle_pos_x_range[1], (1, 1), self.device
+                ).item()
+                sy = sample_uniform(
+                    cfg.sprite_bottle_pos_y_range[0], cfg.sprite_bottle_pos_y_range[1], (1, 1), self.device
+                ).item()
+                sx, sy = self._clamp_xy_to_table(sx, sy)
+                if math.hypot(sx - cx, sy - cy) < cfg.min_sprite_sep_dist:
+                    continue
+                if math.hypot(sx - bx, sy - by) < cfg.min_sprite_sep_dist:
+                    continue
+                cup_xy[i] = torch.tensor([cx, cy], device=self.device)
+                bottle_xy[i] = torch.tensor([bx, by], device=self.device)
+                sprite_xy[i] = torch.tensor([sx, sy], device=self.device)
+                ok = True
+                break
+            if not ok:
+                # Fallback: fixed layout
+                cup_xy[i, 0], cup_xy[i, 1] = CUP_POS[0], CUP_POS[1]
+                bottle_xy[i, 0], bottle_xy[i, 1] = BOTTLE_POS[0], BOTTLE_POS[1]
+                sprite_xy[i, 0], sprite_xy[i, 1] = SPRITE_BOTTLE_POS[0], SPRITE_BOTTLE_POS[1]
+
+        return cup_xy, bottle_xy, sprite_xy
