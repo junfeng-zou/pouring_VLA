@@ -195,6 +195,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OpenVLA LoRA fine-tuning on HDF5 pouring demos")
     p.add_argument("--data_dir", type=str, default="data/vla_dataset", help="Folder with episode_*.hdf5")
     p.add_argument(
+        "--action_source",
+        type=str,
+        default="actions",
+        choices=("actions", "actions_raw"),
+        help="训练使用的动作字段：actions 或 actions_raw",
+    )
+    p.add_argument(
         "--vla_path",
         type=str,
         default="openvla/openvla-7b",
@@ -335,6 +342,7 @@ def main() -> None:
         processor.tokenizer,
         image_transform,
         prompt_builder_fn=VicunaV15ChatPromptBuilder,
+        action_source=args.action_source,
     )
 
     if accelerator.is_main_process:
