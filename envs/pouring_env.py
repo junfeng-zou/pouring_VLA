@@ -399,6 +399,8 @@ class PouringEnvCfg(DirectRLEnvCfg):
     pos_action_scale = 0.005   # meters per step (for EE position)
     rot_action_scale = 0.01    # radians per step (for EE orientation)
     teleop_delta_frame = "ee"  # "ee": deltas interpreted in end-effector frame
+    # False: [0:3] 已为米/步、[3:6] 已为弧度/步（如 VLA 反归一化后直接对接），不再乘上式 scale；夹爪仍 [-1,1]
+    cart_action_is_physical_delta: bool = False
 
     # -- debug visualization (USD BasisCurves; link_6 body frame: X红 Y绿 Z蓝) --
     debug_visualize_ee_frame: bool = False
@@ -728,12 +730,20 @@ class PouringEnv(DirectRLEnv):
         - [3:6] — EE orientation delta as axis-angle in root frame (radians)
         - [6]   — gripper command: +1 = open, -1 = closed
         """
-        self.actions = actions.clone().clamp(-1.0, 1.0)
+        self.actions = actions.clone()
+        if self.cfg.cart_action_is_physical_delta:
+            self.actions[:, 6:7] = self.actions[:, 6:7].clamp(-1.0, 1.0)
+        else:
+            self.actions = self.actions.clamp(-1.0, 1.0)
 
-        # Scale Cartesian deltas
+        # Scale Cartesian deltas (teleop [-1,1] → m/rad); physical 模式不再乘系数
         cart_delta = torch.zeros(self.num_envs, 6, device=self.device)
-        cart_delta[:, 0:3] = self.actions[:, 0:3] * self.cfg.pos_action_scale
-        cart_delta[:, 3:6] = self.actions[:, 3:6] * self.cfg.rot_action_scale
+        if self.cfg.cart_action_is_physical_delta:
+            cart_delta[:, 0:3] = self.actions[:, 0:3]
+            cart_delta[:, 3:6] = self.actions[:, 3:6]
+        else:
+            cart_delta[:, 0:3] = self.actions[:, 0:3] * self.cfg.pos_action_scale
+            cart_delta[:, 3:6] = self.actions[:, 3:6] * self.cfg.rot_action_scale
 
         # Only update arm targets when there is actual Cartesian input.
         # Otherwise keep previous targets so PD controller holds position against gravity.
