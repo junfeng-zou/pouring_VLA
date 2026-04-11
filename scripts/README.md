@@ -5,8 +5,9 @@
 ## `scripts/collect/` — 数据采集
 
 | 脚本 | 用途 | 运行方式 |
-|------|------|----------|
+|------|------|------|
 | `teleop_collect.py` | 仿真里手柄采集 + HDF5 | Isaac Lab |
+| `auto_collect.py` | **自动采集（无需手柄）**，基于预设规则执行倒水动作 | Isaac Lab |
 | `real_teleop_collect.py` | 真机采集（拖拽 / 手柄） | 仓库根目录普通 `python` |
 
 ## `scripts/env/` — 环境自检
@@ -30,6 +31,22 @@
 | `convert_dobot_urdf.py` | URDF → USD | Isaac Lab / isaac-sim `python.sh` |
 | `verify_dobot_nova5.py` | Nova5 USD 验证 | Isaac Lab |
 | `dobot_nova5_cfg.py` | `ArticulationCfg` 片段（供其它脚本 import / 参考） | 非入口，按需 import |
+
+## `scripts/robot/rviz_replay/` — HDF5 关节轨迹在 RViz2 中回放
+
+| 内容 | 说明 |
+|------|------|
+| `launch/rviz_nova5_replay.launch.py` | 静态 TF、`/robot_description`、`robot_state_publisher`、可选 RViz |
+| `hdf5_rviz_replay.py` | 读 HDF5，发布 `/joint_states` |
+| `robot_description_topic_pub.py` | 将 URDF 字符串发到 `/robot_description` 话题 |
+| `urdf/`、`meshes/` | Dobot 各机型 URDF 与 STL（供 RViz 网格） |
+
+示例（仓库根目录、已 `source` ROS2）：
+
+```bash
+ros2 launch scripts/robot/rviz_replay/launch/rviz_nova5_replay.launch.py
+python3 scripts/robot/rviz_replay/hdf5_rviz_replay.py --episode <episode.hdf5> --mode joints
+```
 
 运行示例：
 
