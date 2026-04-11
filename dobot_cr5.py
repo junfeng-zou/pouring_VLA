@@ -149,6 +149,18 @@ class DobotCR5:
         """通过 Dashboard 查询当前关节角度"""
         response = self._send_dashboard_command("GetAngle()")
         return response
+
+    def get_joint_angles(self) -> List[float]:
+        """实时反馈中的关节角（度），线程安全快照。"""
+        return list(self.joint_angles)
+
+    def get_actual_joint_speeds(self) -> List[float]:
+        """实时反馈中的关节速度。"""
+        return list(self.actual_joint_speeds)
+
+    def get_cartesian_pose(self) -> List[float]:
+        """实时反馈笛卡尔位姿 [x,y,z, rx,ry,rz]：位置 m，姿态度（与 ServoP 输入一致）。"""
+        return list(self.cartesian_pose)
     
     def joint_mov_j(self, joints: List[float]):
         """关节运动（角度单位：度）"""
