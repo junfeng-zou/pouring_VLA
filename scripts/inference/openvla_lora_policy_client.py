@@ -12,6 +12,9 @@ OpenVLA-7B + LoRA 策略端 — 无 Isaac，仅 GPU 推理；通过 TCP 接收�
         --host 127.0.0.1 --port 9875 \\
         --base_checkpoint /path/to/openvla-7b \\
         --lora_path LoRA_train/runs/.../final_lora
+
+若仿真端使用 pouring_sim_policy_server.py 的 --physical_cart_actions（前 6 维已为米/步与弧度/步），
+请设 --cart_action_gain 1，避免再被放大并 clip 到 [-1,1]。
 """
 
 from __future__ import annotations
@@ -63,7 +66,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Processor/tokenizer 目录；默认与 --base_checkpoint 相同（勿用 LoRA 目录，易触发 tokenizers 解析错误）",
     )
-    p.add_argument("--task", type=str, default="pour cola from bottle into cup")
+    p.add_argument("--task", type=str, default="move the bottle above the cup and pour coke")
     p.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--unnorm_key", type=str, default="pouring_hdf5")
     p.add_argument("--merge_lora", action="store_true")
@@ -72,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         "--cart_action_gain",
         type=float,
         default=8.0,
-        help="仅放大前 6 维（位姿）再 clip；VLA 常为 ±0.01、手柄为 ±1。默认 8 便于仿真里看见运动；与训练一致时用 1",
+        help="仅放大前 6 维（位姿）再 clip 到 [-1,1]；遥操归一化时常用。反归一化已是物理增量且仿真用 --physical_cart_actions 时请用 1",
     )
     p.add_argument(
         "--recv_timeout_s",
@@ -153,7 +156,10 @@ def main() -> int:
                 if bgr is None:
                     raise ValueError("JPEG 解码失败")
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
+                # --- 新增的 Debug 代码 ---
+                if n < 5:  # 只保存前 5 帧看看
+                    cv2.imwrite(f"debug_vla_obs_{n}.jpg", bgr)
+                # -------------------------
                 action_np, ema_prev = infer_action_vector(
                     model,
                     processor,
