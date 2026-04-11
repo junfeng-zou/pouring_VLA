@@ -120,3 +120,27 @@ logs/
 *.tmp
 *.bak
 *.orig
+
+# -----------------------------------------------------------------------------
+# RViz HDF5 replay — URDF and mesh assets (large CAD; keep local)
+# -----------------------------------------------------------------------------
+scripts/robot/rviz_replay/urdf/
+scripts/robot/rviz_replay/meshes/
+
+# -----------------------------------------------------------------------------
+# Gripper — track source in git; ignore docs, requirements, and build artifacts
+# -----------------------------------------------------------------------------
+tools/gripper/*.md
+tools/gripper/requirements.txt
+tools/gripper/*.hex
+tools/gripper/*.ihx
+tools/gripper/*.lk
+tools/gripper/*.lst
+tools/gripper/*.map
+tools/gripper/*.mem
+tools/gripper/*.rel
+tools/gripper/*.rst
+tools/gripper/*.sym
+
+# Local-only LoRA training server entrypoint (not shared)
+LoRA_train/code/train_lora_server.py
