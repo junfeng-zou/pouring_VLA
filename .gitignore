@@ -99,6 +99,8 @@ assets/
 
 # Fine-tuning runs (LoRA adapters, intermediate checkpoints, copied tokenizers)
 LoRA_train/runs/
+# Repo-root training outputs (checkpoints, tokenizers copied from training)
+/runs/
 
 # Experiment tracking
 wandb/
@@ -144,3 +146,7 @@ tools/gripper/*.sym
 
 # Local-only LoRA training server entrypoint (not shared)
 LoRA_train/code/train_lora_server.py
+
+# Debug images & local agent / scratch notes (repo root)
+/debug_*.jpg
+/cmd.md
