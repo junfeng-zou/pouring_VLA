@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="在末端 link_6 显示坐标系：X 红、Y 绿、Z 蓝（USD 箭头）",
     )
+    p.add_argument(
+        "--physical_cart_actions",
+        action="store_true",
+        help="前 6 维为米/步与弧度/步（反归一化物理增量），PouringEnv 不再乘 pos/rot scale；夹爪仍 [-1,1]",
+    )
     return p.parse_args()
 
 
@@ -113,6 +118,8 @@ def main() -> int:
     cfg.scene.num_envs = 1
     if args.show_ee_frame:
         cfg.debug_visualize_ee_frame = True
+    if args.physical_cart_actions:
+        cfg.cart_action_is_physical_delta = True
     env = PouringEnv(cfg)
 
     model, processor, action_dim = load_openvla_with_lora(
