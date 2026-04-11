@@ -175,17 +175,41 @@ def decode_normalized_action(
             "请确认 generate 传入 min_new_tokens=action_dim，且未截断提示。"
         )
     predicted_token_ids = row[prompt_len:end].detach().cpu().numpy()
+    print(
+        "[DEBUG] raw_action_token_ids="
+        f"{predicted_token_ids.tolist()} (prompt_len={prompt_len}, action_dim={action_dim})"
+    )
     discretized = core.vocab_size - predicted_token_ids
     discretized = np.clip(discretized - 1, 0, core.bin_centers.shape[0] - 1)
-    return core.bin_centers[discretized]
+    bin_centers = core.bin_centers
+    if isinstance(bin_centers, torch.Tensor):
+        bin_centers_np = bin_centers.detach().cpu().numpy()
+    else:
+        bin_centers_np = np.asarray(bin_centers)
+    return bin_centers_np[discretized]
 
 
 def unnormalize_action_q01q99(model, normalized: np.ndarray, unnorm_key: str) -> np.ndarray:
-    stats = model.get_action_stats(unnorm_key)
+    core = _unwrap_for_action_decode(model)
+    stats = core.get_action_stats(unnorm_key)
     mask = stats.get("mask", np.ones_like(stats["q01"], dtype=bool))
     action_high = np.array(stats["q99"], dtype=np.float64)
     action_low = np.array(stats["q01"], dtype=np.float64)
-    return np.where(mask, 0.5 * (normalized + 1.0) * (action_high - action_low) + action_low, normalized)
+    normalized_np = np.asarray(normalized, dtype=np.float64)
+    return np.where(
+        mask,
+        0.5 * (normalized_np + 1.0) * (action_high - action_low) + action_low,
+        normalized_np,
+    )
+
+
+def debug_print_action_stats(model, unnorm_key: str) -> None:
+    stats = model.get_action_stats(unnorm_key)
+    q01 = np.array(stats["q01"], dtype=np.float64)
+    q99 = np.array(stats["q99"], dtype=np.float64)
+    print(f"[DEBUG] action_stats key={unnorm_key}")
+    print(f"[DEBUG] q01={q01.tolist()}")
+    print(f"[DEBUG] q99={q99.tolist()}")
 
 
 def apply_cart_action_gain(action_7: np.ndarray, gain: float) -> np.ndarray:
@@ -279,6 +303,7 @@ def load_openvla_with_lora(
 
     action_dim = model.get_action_dim(unnorm_key)
     print(f"unnorm_key={unnorm_key}  action_dim={action_dim}")
+    debug_print_action_stats(model, unnorm_key)
 
     return model, processor, action_dim
 
