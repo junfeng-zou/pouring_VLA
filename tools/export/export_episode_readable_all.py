@@ -4,10 +4,10 @@ Export all episode contents into a human-readable folder.
 
 Outputs include:
 - metadata json
-- per-step CSV table
-- full arrays (.npy)
-- RGB / side RGB frames (.png)
-- depth raw (.npy) and depth visualization (.png)
+- per-step json table
+- full arrays (.json)
+- RGB / side RGB frames (.jpg)
+- depth raw (.json) and depth visualization (.jpg)
 
 Usage:
   python tools/export/export_episode_readable_all.py \
@@ -45,15 +45,19 @@ def depth_to_vis(depth_hw: np.ndarray, clip_max: float) -> np.ndarray:
 
 
 def save_png(path: Path, img_hwc: np.ndarray) -> None:
-    # Use OpenCV only at write time to avoid dependency issues when not needed.
-    import cv2
+    from PIL import Image
 
-    if img_hwc.ndim == 2:
-        cv2.imwrite(str(path), img_hwc)
+    arr = np.asarray(img_hwc)
+    if arr.ndim == 2:
+        Image.fromarray(arr).save(path)
         return
-    # Input arrays are RGB in the dataset.
-    bgr = cv2.cvtColor(img_hwc, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(str(path), bgr)
+    # Input arrays are RGB in the dataset; PIL expects RGB ordering directly.
+    Image.fromarray(arr).save(path)
+
+
+def save_json(path: Path, obj: object) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
 
 
 def main() -> None:
@@ -69,8 +73,8 @@ def main() -> None:
     p_rgb = out_dir / "images" / "rgb"
     p_side = out_dir / "images" / "rgb_side"
     p_depth_vis = out_dir / "images" / "depth_vis"
-    p_depth_raw = out_dir / "images" / "depth_raw_npy"
-    p_arrays = out_dir / "arrays"
+    p_depth_raw = out_dir / "images" / "depth_raw_json"
+    p_arrays = out_dir / "arrays_json"
     p_tables = out_dir / "tables"
     ensure_dir(p_rgb)
     ensure_dir(p_side)
@@ -82,6 +86,8 @@ def main() -> None:
     with h5py.File(input_path, "r") as f:
         attrs = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in f.attrs.items()}
         actions = f["actions"][:]
+        has_actions_raw = "actions_raw" in f
+        actions_raw = f["actions_raw"][:] if has_actions_raw else None
         states = f["observations/state"][:]
         timestamps = f["timestamps"][:]
         rgb = f["observations/images/rgb"][:]
@@ -90,14 +96,16 @@ def main() -> None:
         rgb_side = f["observations/images/rgb_side"][:] if has_side else None
 
     T = actions.shape[0]
-    # Save arrays
-    np.save(p_arrays / "actions.npy", actions)
-    np.save(p_arrays / "state.npy", states)
-    np.save(p_arrays / "timestamps.npy", timestamps)
-    np.save(p_arrays / "rgb.npy", rgb)
-    np.save(p_arrays / "depth.npy", depth)
+    # Save arrays as JSON for human readability (large files expected).
+    save_json(p_arrays / "actions.json", actions.tolist())
+    if has_actions_raw:
+        save_json(p_arrays / "actions_raw.json", actions_raw.tolist())
+    save_json(p_arrays / "state.json", states.tolist())
+    save_json(p_arrays / "timestamps.json", timestamps.tolist())
+    save_json(p_arrays / "rgb.json", rgb.tolist())
+    save_json(p_arrays / "depth.json", depth.tolist())
     if has_side:
-        np.save(p_arrays / "rgb_side.npy", rgb_side)
+        save_json(p_arrays / "rgb_side.json", rgb_side.tolist())
 
     # Save metadata
     meta = {
@@ -107,6 +115,7 @@ def main() -> None:
         "has_rgb_side": bool(has_side),
         "shapes": {
             "actions": list(actions.shape),
+            "actions_raw": list(actions_raw.shape) if has_actions_raw else None,
             "state": list(states.shape),
             "timestamps": list(timestamps.shape),
             "rgb": list(rgb.shape),
@@ -117,7 +126,7 @@ def main() -> None:
     with (out_dir / "meta.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # Save per-step table
+    # Save per-step table (CSV + JSON)
     ee = states[:, 14:17]
     cup = states[:, 17:20]
     dist_ee_cup = np.linalg.norm(ee - cup, axis=1)
@@ -167,19 +176,44 @@ def main() -> None:
                     float(action_norm[i]),
                 ]
             )
+    steps_json: list[dict[str, float | int]] = []
+    for i in range(T):
+        steps_json.append(
+            {
+                "step": i,
+                "time_s": float(timestamps[i]),
+                "ee_x": float(ee[i, 0]),
+                "ee_y": float(ee[i, 1]),
+                "ee_z": float(ee[i, 2]),
+                "cup_x": float(cup[i, 0]),
+                "cup_y": float(cup[i, 1]),
+                "cup_z": float(cup[i, 2]),
+                "ee_to_cup_dist": float(dist_ee_cup[i]),
+                "dx": float(actions[i, 0]),
+                "dy": float(actions[i, 1]),
+                "dz": float(actions[i, 2]),
+                "droll": float(actions[i, 3]),
+                "dpitch": float(actions[i, 4]),
+                "dyaw": float(actions[i, 5]),
+                "gripper": float(actions[i, 6]),
+                "action_norm_6d": float(action_norm[i]),
+            }
+        )
+    save_json(p_tables / "steps.json", steps_json)
 
     # Save per-frame images
     for i in range(T):
-        name = f"frame_{i:06d}.png"
+        name = f"frame_{i:06d}.jpg"
         save_png(p_rgb / name, rgb[i])
         if has_side:
             save_png(p_side / name, rgb_side[i])
         d = depth[i, :, :, 0]
-        np.save(p_depth_raw / f"frame_{i:06d}.npy", d)
+        save_json(p_depth_raw / f"frame_{i:06d}.json", d.tolist())
         save_png(p_depth_vis / name, depth_to_vis(d, args.depth_clip_max))
 
     print(f"[OK] Exported readable bundle: {out_dir}")
     print(f"[INFO] Steps={T}, has_side={has_side}")
+    print(f"[INFO] has_actions_raw={has_actions_raw}")
     print(f"[INFO] RGB frames: {p_rgb}")
     print(f"[INFO] Depth vis/raw: {p_depth_vis} , {p_depth_raw}")
     print(f"[INFO] Table: {p_tables / 'steps.csv'}")
