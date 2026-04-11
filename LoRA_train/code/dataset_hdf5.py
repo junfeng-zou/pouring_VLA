@@ -52,6 +52,7 @@ class PouringHDF5VLADataset(Dataset):
         prompt_builder_fn: Type[PromptBuilder] = VicunaV15ChatPromptBuilder,
         predict_stop_token: bool = True,
         action_dim: int = 7,
+        action_source: str = "actions",
     ) -> None:
         super().__init__()
         self.data_dir = os.path.abspath(data_dir)
@@ -61,6 +62,9 @@ class PouringHDF5VLADataset(Dataset):
         self.prompt_builder_fn = prompt_builder_fn
         self.predict_stop_token = predict_stop_token
         self.action_dim = action_dim
+        if action_source not in ("actions", "actions_raw"):
+            raise ValueError(f"action_source must be 'actions' or 'actions_raw', got {action_source!r}")
+        self.action_source = action_source
 
         files = _list_hdf5_files(self.data_dir)
         if not files:
@@ -69,9 +73,13 @@ class PouringHDF5VLADataset(Dataset):
         self._episodes: list[tuple[str, int, str]] = []
         for fp in files:
             with h5py.File(fp, "r") as f:
-                actions = f["actions"]
+                if self.action_source not in f:
+                    raise ValueError(f"{fp}: missing dataset '{self.action_source}'")
+                actions = f[self.action_source]
                 if actions.shape[-1] != action_dim:
-                    raise ValueError(f"{fp}: expected actions[..., {action_dim}], got {actions.shape}")
+                    raise ValueError(
+                        f"{fp}: expected {self.action_source}[..., {action_dim}], got {actions.shape}"
+                    )
                 t = int(actions.shape[0])
                 if t < 1:
                     continue
@@ -92,7 +100,7 @@ class PouringHDF5VLADataset(Dataset):
         actions_all: list[np.ndarray] = []
         for fp, t, _ in self._episodes:
             with h5py.File(fp, "r") as f:
-                actions_all.append(np.asarray(f["actions"][:], dtype=np.float32))
+                actions_all.append(np.asarray(f[self.action_source][:], dtype=np.float32))
         stacked = np.concatenate(actions_all, axis=0)
         q01 = np.quantile(stacked, 0.01, axis=0).astype(np.float32)
         q99 = np.quantile(stacked, 0.99, axis=0).astype(np.float32)
@@ -115,7 +123,7 @@ class PouringHDF5VLADataset(Dataset):
 
         with h5py.File(path, "r") as f:
             rgb = np.asarray(f["observations/images/rgb"][t], dtype=np.uint8)
-            action = np.asarray(f["actions"][t], dtype=np.float32)
+            action = np.asarray(f[self.action_source][t], dtype=np.float32)
             lang = _decode_task(f.attrs.get("task", default_lang))
 
         if action.shape != (self.action_dim,):
