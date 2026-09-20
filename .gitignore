@@ -150,3 +150,9 @@ LoRA_train/code/train_lora_server.py
 # Debug images & local agent / scratch notes (repo root)
 /debug_*.jpg
 /cmd.md
+
+# Local presentation files and supporting materials
+/docs/pouring_vla_ppt/
+/docs/pouring_vla_ppt.zip
+/docs/**/*.[pP][pP][tT]
+/docs/**/*.[pP][pP][tT][xX]
